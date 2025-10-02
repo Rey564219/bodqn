@@ -236,6 +236,13 @@ def build_state_vec(ohlc_win_df, extra=None, use_cache=True):
         x = np.concatenate([x, np.asarray(extra, dtype=np.float32)])
     return x.astype(np.float32)  # 確実にfloat32にする
 
+def build_state_vec_fast(ohlc_slice, phase, sec_range):
+    """高速版の状態ベクトル構築（キャッシュなし）"""
+    feat = FeatureExtraction(ohlc_slice, use_cache=False)[-1:]
+    x = feat.values.astype(np.float32).reshape(-1)
+    x = np.concatenate([x, np.asarray([phase, sec_range], dtype=np.float32)])
+    return x.astype(np.float32)
+
 # バッチ処理用の関数を追加
 def build_state_batch(ohlc_data_list, extra_list=None):
     """複数の状態ベクトルを一度に処理"""
@@ -358,99 +365,132 @@ def train_dqn(ohlc_df, pair=pair, save_dir="./Models",
     reward_history = deque(maxlen=1000)
 
     print("[INFO] Starting training...")
+    
+    # 事前計算でボトルネック解消
+    print("[INFO] Pre-computing states for fast training...")
+    
+    # 全ての状態を事前計算
+    pre_computed_states = {}
+    pre_computed_extras = {}
+    
+    for i in range(21, len(ohlc_df)-1):
+        sl = ohlc_df.iloc[i-20:i+1].copy()
+        phase = (sl.index[-1].second % 60)/60.0
+        sec_range = float(sl['high'].iloc[-1] - sl['low'].iloc[-1])
+        
+        s = build_state_vec_fast(sl, phase, sec_range)
+        s = scaler.transform([s])[0].astype(np.float32)
+        
+        pre_computed_states[i] = s
+        pre_computed_extras[i] = (phase, sec_range)
+    
+    print(f"[INFO] Pre-computed {len(pre_computed_states)} states")
+    
+    # バッチ処理での高速化
+    batch_process_size = 1000  # 1000ステップずつまとめて処理
+    
     while steps < updates:
         random.shuffle(idxs)
         
-        # バッチ単位でエピソードを処理して効率化
-        batch_states, batch_actions, batch_rewards = [], [], []
-        batch_next_states = []
-        
-        for i in idxs:
-            sl = ohlc_df.iloc[i-20:i+1].copy()
-            phase = (sl.index[-1].second % 60)/60.0
-            sec_range = float(sl['high'].iloc[-1] - sl['low'].iloc[-1])
-            s = build_state_vec(sl, [phase, sec_range])
-            s = scaler.transform([s])[0].astype(np.float32)  # float32に変換
-
+        # バッチ処理で効率化
+        for batch_start in range(0, len(idxs), batch_process_size):
+            batch_end = min(batch_start + batch_process_size, len(idxs))
+            batch_idxs = idxs[batch_start:batch_end]
+            
+            # バッチで状態とアクションを処理
+            batch_states = np.array([pre_computed_states[i] for i in batch_idxs])
+            
+            # バッチ推論で高速化
             if random.random() < eps:
-                a = random.randrange(ACTIONS)
+                batch_actions = np.random.randint(0, ACTIONS, len(batch_idxs))
             else:
-                q.eval()  # 推論時は評価モードに切り替え
+                q.eval()
                 with torch.no_grad():
-                    s_tensor = torch.from_numpy(s).float().unsqueeze(0).to(device)
-                    qv = q(s_tensor)
-                    a = int(torch.argmax(qv, dim=1).item())
-                q.train()  # 学習モードに戻す
-
-            entry_price = float(sl['close'].iloc[-1])
-            next_close = float(ohlc_df['close'].iloc[i+1])
-            r = compute_reward(a, next_close, entry_price)
-            reward_history.append(r)
-
-            sl_next = ohlc_df.iloc[i-19:i+2].copy()
-            phase_n = (sl_next.index[-1].second % 60)/60.0
-            sec_range_n = float(sl_next['high'].iloc[-1] - sl_next['low'].iloc[-1])
-            ns = build_state_vec(sl_next, [phase_n, sec_range_n])
-            ns = scaler.transform([ns])[0].astype(np.float32)  # float32に変換
-
-            mem.push(s, a, r, ns, 0.0)
-            steps += 1
-
-            # より頻繁に学習を実行
-            if len(mem) >= warmup and steps % 2 == 0:  # 2ステップごとに学習（より頻繁）
-                q.train()  # 学習モードを確実にする
+                    states_tensor = torch.from_numpy(batch_states).float().to(device)
+                    q_values = q(states_tensor)
+                    batch_actions = torch.argmax(q_values, dim=1).cpu().numpy()
+                q.train()
+            
+            # バッチで報酬計算
+            experiences = []
+            for idx, (i, a) in enumerate(zip(batch_idxs, batch_actions)):
+                s = pre_computed_states[i]
                 
-                # Prioritized Replayからサンプリング
-                sample_result = mem.sample(batch_size)
-                if len(sample_result) == 7:  # prioritized sampling
-                    S, A, R, NS, DN, indices, weights = sample_result
-                    weights = torch.from_numpy(weights).float().to(device)
-                else:  # normal sampling
-                    S, A, R, NS, DN, indices, weights = sample_result + (np.ones(batch_size),)
-                    weights = torch.ones(batch_size).to(device)
+                # 価格情報の高速取得
+                entry_price = float(ohlc_df['close'].iloc[i])
+                next_close = float(ohlc_df['close'].iloc[i+1])
+                r = compute_reward(a, next_close, entry_price)
+                reward_history.append(r)
                 
-                # GPU転送（float32に統一）
-                S = torch.from_numpy(S).float().to(device)
-                A = torch.from_numpy(A).long().to(device)
-                R = torch.from_numpy(R).float().to(device)
-                NS = torch.from_numpy(NS).float().to(device)
+                # 次の状態（事前計算済み、またはその場で計算）
+                if i+1 in pre_computed_states:
+                    ns = pre_computed_states[i+1]
+                else:
+                    sl_next = ohlc_df.iloc[i-19:i+2].copy()
+                    phase_n = (sl_next.index[-1].second % 60)/60.0
+                    sec_range_n = float(sl_next['high'].iloc[-1] - sl_next['low'].iloc[-1])
+                    ns = build_state_vec(sl_next, [phase_n, sec_range_n])
+                    ns = scaler.transform([ns])[0].astype(np.float32)
                 
-                # Double DQN実装
-                q_sa = q(S).gather(1, A.view(-1,1)).squeeze(1)
-                with torch.no_grad():
-                    tgt.eval()  # ターゲットネットワークは評価モード
-                    # Double DQNでオーバーエスティメーションを防ぐ
-                    next_actions = q(NS).max(1)[1]
-                    next_q_values = tgt(NS).gather(1, next_actions.view(-1,1)).squeeze(1)
-                    tgt_q = R + gamma * next_q_values
+                experiences.append((s, a, r, ns, 0.0))
+            
+            # バッチでメモリに追加
+            for exp in experiences:
+                mem.push(*exp)
+                steps += 1
                 
-                # TD誤差を計算
-                td_errors = (q_sa - tgt_q).detach().cpu().numpy()
+                # 学習実行（頻度を調整）
+                if len(mem) >= warmup and steps % 8 == 0:  # 8ステップごとに学習（頻度を下げて高速化）
+                    # 高速学習ステップ
+                    q.train()
+                    sample_result = mem.sample(batch_size)
+                    if len(sample_result) == 7:  # prioritized sampling
+                        S, A, R, NS, DN, indices, weights = sample_result
+                        weights = torch.from_numpy(weights).float().to(device)
+                    else:  # normal sampling
+                        S, A, R, NS, DN, indices, weights = sample_result + (np.ones(batch_size),)
+                        weights = torch.ones(batch_size).to(device)
+                    
+                    # GPU転送
+                    S = torch.from_numpy(S).float().to(device)
+                    A = torch.from_numpy(A).long().to(device)
+                    R = torch.from_numpy(R).float().to(device)
+                    NS = torch.from_numpy(NS).float().to(device)
+                    
+                    # Double DQN
+                    q_sa = q(S).gather(1, A.view(-1,1)).squeeze(1)
+                    with torch.no_grad():
+                        tgt.eval()
+                        next_actions = q(NS).max(1)[1]
+                        next_q_values = tgt(NS).gather(1, next_actions.view(-1,1)).squeeze(1)
+                        tgt_q = R + gamma * next_q_values
+                    
+                    # 損失計算と更新
+                    td_errors = (q_sa - tgt_q).detach().cpu().numpy()
+                    loss = F.smooth_l1_loss(q_sa, tgt_q, reduction='none')
+                    loss = (loss * weights).mean()
+                    loss_history.append(loss.item())
+                    
+                    mem.update_priorities(indices, td_errors)
+                    
+                    opt.zero_grad()
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(q.parameters(), max_norm=1.0)
+                    opt.step()
+                    scheduler.step()
+                    
+                    if steps % target_sync == 0:
+                        tgt.load_state_dict(q.state_dict())
+                    
+                    eps = epsilon_end + (epsilon_start-epsilon_end) * math.exp(-(steps-warmup)/epsilon_decay)
                 
-                # Weighted loss (Prioritized Replay)
-                loss = F.smooth_l1_loss(q_sa, tgt_q, reduction='none')
-                loss = (loss * weights).mean()
-                loss_history.append(loss.item())
-                
-                # 優先度を更新
-                mem.update_priorities(indices, td_errors)
-                
-                opt.zero_grad()
-                loss.backward()
-                
-                # 勾配クリッピング
-                torch.nn.utils.clip_grad_norm_(q.parameters(), max_norm=1.0)
-                opt.step()
-                scheduler.step()
-
-                if steps % target_sync == 0:
-                    tgt.load_state_dict(q.state_dict())
-
-                eps = epsilon_end + (epsilon_start-epsilon_end) * math.exp(-(steps-warmup)/epsilon_decay)
-
-            if steps >= updates: break
+                if steps >= updates:
+                    break
+            
+            if steps >= updates:
+                break
         episode += 1
-        if episode % 5 == 0:
+        if episode % 10 == 0:  # 表示頻度を下げて高速化（5→10）
             avg_loss = np.mean(loss_history) if loss_history else 0.0
             avg_reward = np.mean(reward_history) if reward_history else 0.0
             
@@ -459,6 +499,10 @@ def train_dqn(ohlc_df, pair=pair, save_dir="./Models",
                 pickle.dump(scaler, f)
             print(f"[CKPT] Episode={episode}, Steps={steps}, Eps={eps:.3f}, "
                   f"AvgLoss={avg_loss:.4f}, AvgReward={avg_reward:.4f}")
+            
+            # メモリ使用量をチェック（デバッグ用）
+            if device.startswith('cuda'):
+                print(f"[INFO] GPU Memory: {torch.cuda.memory_allocated()/1024**2:.1f}MB")
 
     # 最終保存
     torch.save(q.state_dict(), os.path.join(save_dir, f"dqn_policy_{pair}.pt"))
