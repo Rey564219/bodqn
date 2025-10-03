@@ -14,7 +14,7 @@ import torch.nn.functional as F
 from concurrent.futures import ThreadPoolExecutor
 import multiprocessing as mp
 
-pair = "EURUSD"
+pair = "AUDJPY"
 def _CalcSMAR(df,periods):
     for period in periods:
         ema = ta.EMA(df["close"], period)
