@@ -33,12 +33,12 @@ import torch.nn.functional as F
 # -----------------------
 # 設定
 # -----------------------
-pair = "BTCUSD"
-MODEL_PT = f"./Models/{pair}_dqn.pt"
-MODEL_PKL = f"./Models/{pair}_dqn.pickle"
+pair = "USDJPY"  # BTCUSDからUSDJPYに変更
+MODEL_PT = f"./Models/dqn_policy_{pair}.pt"  # train_dqn.pyの保存形式に合わせる
+MODEL_PKL = f"./Models/dqn_scaler_{pair}.pkl"  # スケーラーファイルも追加
 TICK_INTERVAL_SECONDS = 0.5
 CANDLE_TIMEFRAME = '1min'
-REQUIRED_CANDLES = 11
+REQUIRED_CANDLES = 30  # 11から30に増加（より多くの履歴データ）
 ENTRY_COOLDOWN_SECONDS = 25
 LOG_DIR = "./logs"
 LOG_PATH = os.path.join(LOG_DIR, f"live_signals_{pair}.csv")
@@ -61,7 +61,9 @@ DQN_Q_MARGIN = 0.0  # Holdとの差でエントリーを抑制したければ正
 # -----------------------
 def _CalcSMAR(df,periods):
     for period in periods:
-        df["SMAR_"+str(period)] = ta.EMA(df["close"], period)/df["close"]
+        ema = ta.EMA(df["close"], period)
+        # ゼロ除算を防ぐ
+        df["SMAR_"+str(period)] = np.where(df["close"] != 0, ema/df["close"], 1.0)
     return df
 
 def _CalcRSIR(df,periods):
@@ -69,46 +71,203 @@ def _CalcRSIR(df,periods):
         df["RSIR_"+str(period)] = ta.RSI(df["close"], period)
         df["RSIR_diff_"+str(period)] = df["RSIR_"+str(period)].diff()
     return df
-
-def _CalcOtherR(df,periods):
-    for period in periods:
-        df['bb_width'+str(period)] = ta.BBANDS(df['close'], period)[1] - ta.BBANDS(df['close'], period)[0]
-        df['bb_width_diff' + str(period)] = df['bb_width'+str(period)].diff()
-        df['atr'+str(period)] = ta.ATR(df['high'], df['low'], df['close'], period)
-        df['atr_diff' + str(period)] = df['atr'+str(period)].diff()
-    # ストキャスティクス (ta.STOCH returns arrays; ensure length match)
+def _CalcOtherR(df, periods):
+    # 大量データの場合、計算する期間を制限
+    if len(df) > 100:
+        # 最後の部分のみ計算（効率化）
+        calc_df = df.iloc[-min(500, len(df)):].copy()  # 最大500行まで
+        
+        for period in periods:
+            if len(calc_df) < period:
+                continue  # 期間が不足している場合はスキップ
+                
+            # ボリンジャーバンド幅
+            try:
+                upper, middle, lower = ta.BBANDS(calc_df['close'], period)
+                calc_df['bb_width'+str(period)] = upper - lower
+                calc_df['bb_width_diff' + str(period)] = calc_df['bb_width'+str(period)].diff()
+                
+                # ボリンジャーバンドの位置（%B）- ゼロ除算防止
+                width = upper - lower
+                calc_df['bb_percent'+str(period)] = np.where(width != 0, (calc_df['close'] - lower) / width, 0.5)
+                
+                # ATR（平均的な値幅）
+                calc_df['atr'+str(period)] = ta.ATR(calc_df['high'], calc_df['low'], calc_df['close'], period)
+                calc_df['atr_diff' + str(period)] = calc_df['atr'+str(period)].diff()
+                
+                # 価格変動率 - 異常値防止
+                calc_df['price_change'+str(period)] = calc_df['close'].pct_change(period).clip(-1, 1)
+                
+                # ボラティリティ
+                calc_df['volatility'+str(period)] = calc_df['close'].rolling(period).std()
+                
+                # 新しい特徴量：価格の勢い（軽量版）
+                calc_df['momentum'+str(period)] = ta.MOM(calc_df['close'], period)
+                calc_df['momentum_norm'+str(period)] = calc_df['momentum'+str(period)] / calc_df['close']
+                
+                # 価格の位置（高値・安値に対する相対位置）
+                high_max = calc_df['high'].rolling(period).max()
+                low_min = calc_df['low'].rolling(period).min()
+                calc_df['high_pos'+str(period)] = (calc_df['close'] - low_min) / (high_max - low_min + 1e-8)
+                
+            except Exception as e:
+                print(f"[WARNING] Error calculating period {period}: {e}")
+                continue
+        
+        # 元のデータフレームに結果を統合（最後の行のみ）
+        for col in calc_df.columns:
+            if col not in df.columns:
+                df[col] = np.nan
+                df.iloc[-1, df.columns.get_loc(col)] = calc_df.iloc[-1][col]
+    else:
+        # 小さなデータの場合は通常の計算
+        for period in periods:
+            if len(df) < period:
+                continue
+                
+            # ボリンジャーバンド幅
+            upper, middle, lower = ta.BBANDS(df['close'], period)
+            df['bb_width'+str(period)] = upper - lower
+            df['bb_width_diff' + str(period)] = df['bb_width'+str(period)].diff()
+            
+            # ボリンジャーバンドの位置（%B）- ゼロ除算防止
+            width = upper - lower
+            df['bb_percent'+str(period)] = np.where(width != 0, (df['close'] - lower) / width, 0.5)
+            
+            # ATR（平均的な値幅）
+            df['atr'+str(period)] = ta.ATR(df['high'], df['low'], df['close'], period)
+            df['atr_diff' + str(period)] = df['atr'+str(period)].diff()
+            
+            # 価格変動率 - 異常値防止
+            df['price_change'+str(period)] = df['close'].pct_change(period).clip(-1, 1)
+            
+            # ボラティリティ
+            df['volatility'+str(period)] = df['close'].rolling(period).std()
+            
+            # 新しい特徴量：価格の勢い
+            df['momentum'+str(period)] = ta.MOM(df['close'], period)
+            df['momentum_norm'+str(period)] = df['momentum'+str(period)] / df['close']
+            
+            # 価格の位置（高値・安値に対する相対位置）
+            high_max = df['high'].rolling(period).max()
+            low_min = df['low'].rolling(period).min()
+            df['high_pos'+str(period)] = (df['close'] - low_min) / (high_max - low_min + 1e-8)
+    
+    # より軽量な技術指標のみ計算
     try:
-        slowk, slowd = ta.STOCH(df['high'], df['low'], df['close'])
-        df['slowk'+str(period)] = slowk
-        df['slowk_diff'+str(period)] = df['slowk'+str(period)].diff()
-        df['slowd'+str(period)] = slowd
-        df['slowd_diff'+str(period)] = df['slowd'+str(period)].diff()
-    except Exception:
-        pass
+        # ストキャスティクス（期間を固定）
+        period = 14
+        slowk, slowd = ta.STOCH(df['high'], df['low'], df['close'], period)
+        df['slowk'] = slowk
+        df['slowk_diff'] = df['slowk'].diff()
+        df['slowd'] = slowd
+        df['slowd_diff'] = df['slowd'].diff()
+        
+        # MACD
+        macd, macdsignal, macdhist = ta.MACD(df['close'])
+        df['macd'] = macd
+        df['macd_signal'] = macdsignal
+        df['macd_hist'] = macdhist
+        df['macd_cross'] = np.where(df['macd'] > df['macd_signal'], 1, -1)  # MACDクロス
+        
+        # Williams %R
+        df['williams_r'] = ta.WILLR(df['high'], df['low'], df['close'])
+        
+        # CCI (Commodity Channel Index)
+        df['cci'] = ta.CCI(df['high'], df['low'], df['close'])
+        
+        # ROC (Rate of Change)
+        df['roc'] = ta.ROC(df['close'])
+        
+    except Exception as e:
+        print(f"[WARNING] Error in additional indicators: {e}")
+    
+    # 全ての列でNaNと無限大を処理
+    for col in df.columns:
+        if df[col].dtype in ['float64', 'float32']:
+            df[col] = df[col].replace([np.inf, -np.inf], np.nan)
+            df[col] = df[col].ffill().fillna(0)  # 新しい記法に変更
+    
     return df
 
-def FeatureExtraction(df):
-    # expects df with columns open,high,low,close and DatetimeIndex
-    df = df.copy().reset_index(drop=True)
-    periods_RSI = [3, 5, 10]
-    periods_SMA = [3, 5, 10]
-    # Ensure float dtype
-    for c in ['open','high','low','close']:
-        df[c] = df[c].astype(float)
-    # apply indicators
+# 特徴量計算のキャッシュを追加
+_feature_cache = {}
+
+def FeatureExtraction(df, use_cache=True):
+    if use_cache:
+        # DataFrameのハッシュをキーにしてキャッシュ
+        df_hash = hash(tuple(df.iloc[-1].values))
+        if df_hash in _feature_cache:
+            return _feature_cache[df_hash]
+    
+    df = df.copy()
+    periods_RSI = [14, 21]  # 期間を削減（計算量削減）
+    periods_SMA = [10, 20]  # 期間を削減（計算量削減）
+
     df = _CalcSMAR(df, periods_SMA)
     df = _CalcRSIR(df, periods_RSI)
     df = _CalcOtherR(df, periods_RSI)
-    df["open_r"] = df["open"]/df["close"]
-    df["high_r"] = df["high"]/df["close"]
-    df["low_r"] = df["low"]/df["close"]
-    # drop originals if exist
-    cols_to_drop = [c for c in ["open","close","high","low"] if c in df.columns]
-    df = df.drop(columns=cols_to_drop)
-    # forward-fill / fillna to avoid NaNs in short windows
-    df = df.fillna(method="ffill").fillna(0.0)
-    return df
 
+    # 基本的な価格比率 - ゼロ除算防止
+    df["open_r"] = np.where(df["close"] != 0, df["open"]/df["close"], 1.0)
+    df["high_r"] = np.where(df["close"] != 0, df["high"]/df["close"], 1.0)
+    df["low_r"] = np.where(df["close"] != 0, df["low"]/df["close"], 1.0)
+    
+    # 追加の特徴量 - ゼロ除算防止
+    df["hl_ratio"] = np.where(df["close"] != 0, (df["high"] - df["low"]) / df["close"], 0.0)
+    df["oc_ratio"] = np.where(df["close"] != 0, (df["open"] - df["close"]) / df["close"], 0.0)
+    
+    # 移動平均との関係 - ゼロ除算防止
+    for period in [5, 10, 20, 50]:
+        if len(df) >= period:
+            sma = df["close"].rolling(period).mean()
+            ema = df["close"].ewm(span=period).mean()
+            df[f"sma_distance_{period}"] = np.where(sma != 0, (df["close"] - sma) / sma, 0.0)
+            df[f"ema_distance_{period}"] = np.where(ema != 0, (df["close"] - ema) / ema, 0.0)
+            df[f"sma_ema_diff_{period}"] = np.where(ema != 0, (sma - ema) / ema, 0.0)
+    
+    # 価格と移動平均の交差シグナル
+    sma5 = df["close"].rolling(5).mean()
+    sma20 = df["close"].rolling(20).mean()
+    df["golden_cross"] = np.where(sma5 > sma20, 1, 0)  # ゴールデンクロス
+    df["dead_cross"] = np.where(sma5 < sma20, 1, 0)    # デッドクロス
+    
+    # 前の足との比較 - 異常値クリップ
+    df["prev_close_ratio"] = df["close"].pct_change().clip(-1, 1)
+    df["prev_volume_ratio"] = df["volume"].pct_change().clip(-10, 10) if "volume" in df.columns else 0
+    
+    # 複数期間の価格変化率
+    for lookback in [2, 3, 5]:
+        df[f"price_change_{lookback}"] = df["close"].pct_change(lookback).clip(-1, 1)
+    
+    # 高値・安値のブレイクアウトシグナル
+    for period in [10, 20]:
+        df[f"high_breakout_{period}"] = (df["high"] > df["high"].rolling(period).max().shift(1)).astype(int)
+        df[f"low_breakout_{period}"] = (df["low"] < df["low"].rolling(period).min().shift(1)).astype(int)
+    
+    result = df.drop(columns = ["open", "close", "high", "low", "volume"], errors='ignore')
+    
+    # 異常値処理
+    result = result.replace([np.inf, -np.inf], np.nan)  # 無限大をNaNに変換
+    result = result.fillna(0)  # NaNを0で埋める
+    
+    # 異常に大きな値をクリップ
+    numeric_columns = result.select_dtypes(include=[np.number]).columns
+    for col in numeric_columns:
+        # 99.9%分位点でクリップ
+        upper_limit = result[col].quantile(0.999)
+        lower_limit = result[col].quantile(0.001)
+        result[col] = result[col].clip(lower=lower_limit, upper=upper_limit)
+    
+    if use_cache:
+        _feature_cache[df_hash] = result
+        # キャッシュサイズ制限
+        if len(_feature_cache) > 10000:
+            # 古いキャッシュを削除
+            oldest_key = next(iter(_feature_cache))
+            del _feature_cache[oldest_key]
+    
+    return result
 # -----------------------
 # human-like 操作関数 (Playwright用)
 # -----------------------
@@ -223,23 +382,58 @@ def ticks_to_ohlc(ticks, timeframe_sec=60, max_bars=200):
 class QNet(nn.Module):
     def __init__(self, input_dim, output_dim=3):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, 128),
-            nn.ReLU(),
-            nn.Linear(128, 128),
-            nn.ReLU(),
+        # より深く、幅広いネットワークで表現力向上
+        self.feature_extractor = nn.Sequential(
+            nn.Linear(input_dim, 512),
+            nn.LayerNorm(512),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.3),
+            
+            nn.Linear(512, 512),
+            nn.LayerNorm(512),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.3),
+            
+            nn.Linear(512, 256),
+            nn.LayerNorm(256),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.2),
+        )
+        
+        # 価値関数とアドバンテージ関数を分離（Dueling DQN）
+        self.value_stream = nn.Sequential(
+            nn.Linear(256, 128),
+            nn.ReLU(inplace=True),
+            nn.Linear(128, 1)
+        )
+        
+        self.advantage_stream = nn.Sequential(
+            nn.Linear(256, 128),
+            nn.ReLU(inplace=True),
             nn.Linear(128, output_dim)
         )
-    def forward(self, x):
-        return self.net(x)
+    
+    def forward(self, x): 
+        features = self.feature_extractor(x)
+        
+        # Dueling DQN: Q(s,a) = V(s) + (A(s,a) - mean(A(s,a)))
+        value = self.value_stream(features)
+        advantage = self.advantage_stream(features)
+        
+        # アドバンテージの正規化
+        advantage_mean = advantage.mean(dim=1, keepdim=True)
+        q_values = value + (advantage - advantage_mean)
+        
+        return q_values
 
 dqn_model = None
 dqn_is_torch = False
+scaler = None  # スケーラーを追加
 
 def infer_feature_dim_for_model():
     # build a dummy OHLC window so FeatureExtraction can compute features
     try:
-        N = max(30, REQUIRED_CANDLES + 10)
+        N = max(50, REQUIRED_CANDLES + 20)  # より多くのサンプル
         idx = pd.date_range(end=datetime.now(), periods=N, freq='T')
         base = np.linspace(1.0, 1.0 + 0.001*N, N)
         dummy = pd.DataFrame({
@@ -249,9 +443,11 @@ def infer_feature_dim_for_model():
             'close': base
         }, index=idx)
         feat = FeatureExtraction(dummy)[-1:]
+        print(f"[INFO] 推定特徴量次元: {feat.shape[1]} + 2 (phase, range) = {feat.shape[1] + 2}")
         return feat.shape[1]
-    except Exception:
-        return 20  # fallback
+    except Exception as e:
+        print(f"[WARN] 特徴量次元推定失敗: {e}")
+        return 50  # より大きなfallback値
 
 # try torch .pt first
 if os.path.exists(MODEL_PT):
@@ -278,26 +474,20 @@ if os.path.exists(MODEL_PT):
     except Exception as e:
         print(f"[WARN] torch load 失敗: {e} - pickleを試行します")
 
-# if not loaded, try pickle
-if dqn_model is None and os.path.exists(MODEL_PKL):
-    try:
-        with open(MODEL_PKL, "rb") as f:
-            data = pickle.load(f)
-        # if dict with 'model' key (user earlier used this pattern)
-        if isinstance(data, dict) and "model" in data:
-            dqn_model = data["model"]
-            dqn_is_torch = isinstance(dqn_model, nn.Module)
-            print("[INFO] DQN (pickled dict) ロード完了")
-        else:
-            # if whole object is a sklearn-like model (has predict / predict_proba)
-            dqn_model = data
-            dqn_is_torch = isinstance(dqn_model, nn.Module)
-            print("[INFO] DQN (pickled object) ロード完了")
-    except Exception as e:
-        print(f"[WARN] pickle load 失敗: {e}")
+# Load scaler
+try:
+    with open(MODEL_PKL, "rb") as f:
+        scaler = pickle.load(f)
+    print("[INFO] Scaler ロード完了")
+except Exception as e:
+    print(f"[WARN] Scaler load 失敗: {e}")
+    scaler = None
 
 if dqn_model is None:
     print("[WARN] DQNモデルが見つかりません。予測はスキップされます。")
+
+if scaler is None:
+    print("[WARN] スケーラーが見つかりません。特徴量の正規化ができません。")
 
 # -----------------------
 # ログ関数 (q値とactionを記録)
@@ -389,7 +579,12 @@ with sync_playwright() as p:
             recent_prices.append(current_price)
 
             # OHLC生成
-            ohlc_data = ticks_to_ohlc(all_ticks, timeframe_sec=60, max_bars=REQUIRED_CANDLES+20)
+            try:
+                ohlc_data = ticks_to_ohlc(all_ticks, timeframe_sec=60, max_bars=REQUIRED_CANDLES+20)
+            except Exception as e:
+                print(f"[WARN] OHLC生成エラー: {e}")
+                time.sleep(TICK_INTERVAL_SECONDS)
+                continue
 
             if len(ohlc_data) < REQUIRED_CANDLES:
                 # 足りない
@@ -407,13 +602,22 @@ with sync_playwright() as p:
                 phase = 0.0
 
             # FeatureExtraction expects DataFrame with open/high/low/close columns
-            fea_ohlc = ohlc_data[['open','high','low','close']].copy()
-            feats_df = FeatureExtraction(fea_ohlc)
-            # take last row
-            feat_row = feats_df.iloc[-1].values.astype(np.float32)
-            # second extra: range of last candle
-            sec_range = float(fea_ohlc['high'].iloc[-1] - fea_ohlc['low'].iloc[-1])
-            feat_vec = np.concatenate([feat_row, np.asarray([phase, sec_range], dtype=np.float32)])
+            try:
+                fea_ohlc = ohlc_data[['open','high','low','close']].copy()
+                feats_df = FeatureExtraction(fea_ohlc)
+                # take last row
+                feat_row = feats_df.iloc[-1].values.astype(np.float32)
+                # second extra: range of last candle
+                sec_range = float(fea_ohlc['high'].iloc[-1] - fea_ohlc['low'].iloc[-1])
+                feat_vec = np.concatenate([feat_row, np.asarray([phase, sec_range], dtype=np.float32)])
+                
+                # 特徴量の正規化（スケーラーがある場合）
+                if scaler is not None:
+                    feat_vec = scaler.transform([feat_vec])[0].astype(np.float32)
+            except Exception as e:
+                print(f"[WARN] 特徴量抽出エラー: {e}")
+                time.sleep(TICK_INTERVAL_SECONDS)
+                continue
 
             # Predict via model (if present)
             q_values = None
@@ -428,74 +632,60 @@ with sync_playwright() as p:
                 _log_signal(current_time, current_price, phase, None, None, "Hold", False, reason)
                 time.sleep(TICK_INTERVAL_SECONDS)
                 continue
+                
+            if scaler is None:
+                reason = "no_scaler"
+                print(f"[{current_time.strftime('%H:%M:%S')}] スケーラー無し - スキップ")
+                _log_signal(current_time, current_price, phase, None, None, "Hold", False, reason)
+                time.sleep(TICK_INTERVAL_SECONDS)
+                continue
 
-            # Torch model path
+            # Torch model prediction
             if dqn_is_torch and isinstance(dqn_model, nn.Module):
-                with torch.no_grad():
-                    t = torch.from_numpy(feat_vec).unsqueeze(0).float()
-                    out = dqn_model(t)
-                    qv = out.cpu().numpy().reshape(-1)
-                # Ensure qv length 3; if model outputs 2 (High/Low), adapt:
-                if qv.shape[0] == 2:
-                    # map to [hold, high, low] by: hold=0, high=qv[0], low=qv[1]
-                    q_values = np.array([0.0, float(qv[0]), float(qv[1])], dtype=float)
-                elif qv.shape[0] >= 3:
-                    q_values = qv[:3].astype(float)
-                else:
-                    q_values = np.pad(qv.astype(float), (0,3-qv.shape[0]), 'constant')
-                action_idx = int(np.argmax(q_values))
-                # map idx -> action: 0=Hold,1=High,2=Low
-                action_map = {0:"Hold", 1:"High", 2:"Low"}
-                action_str = action_map.get(action_idx, "Hold")
-            else:
-                # non-torch (sklearn/pickle) model: try predict_proba or predict
                 try:
-                    # if model has predict_proba and outputs 3 probs:
-                    if hasattr(dqn_model, "predict_proba"):
-                        proba = dqn_model.predict_proba(pd.DataFrame([feat_vec]))
-                        # pick last row
-                        if proba.shape[1] >= 3:
-                            q_values = proba[0][:3].astype(float)
-                        elif proba.shape[1] == 2:
-                            # binary classifier -> map to high/low and hold=0
-                            q_values = np.array([0.0, float(proba[0,1]), float(1.0-proba[0,1])])
-                        else:
-                            q_values = np.pad(proba[0].astype(float), (0,3-proba.shape[1]), 'constant')
+                    with torch.no_grad():
+                        t = torch.from_numpy(feat_vec).unsqueeze(0).float()
+                        out = dqn_model(t)
+                        qv = out.cpu().numpy().reshape(-1)
+                    
+                    # Ensure qv length 3
+                    if qv.shape[0] >= 3:
+                        q_values = qv[:3].astype(float)
                     else:
-                        # fallback: use predict -> binary label; convert to q-values
-                        pred = dqn_model.predict(pd.DataFrame([feat_vec]))
-                        label = int(pred[0])
-                        # interpret label 1 -> High, 0 -> Low ; create q vector
-                        if label == 1:
-                            q_values = np.array([0.0, 1.0, 0.0])
-                            action_idx = 1
-                            action_str = "High"
-                        else:
-                            q_values = np.array([0.0, 0.0, 1.0])
-                            action_idx = 2
-                            action_str = "Low"
+                        q_values = np.pad(qv.astype(float), (0,3-qv.shape[0]), 'constant')
+                    
+                    action_idx = int(np.argmax(q_values))
+                    # map idx -> action: 0=Hold,1=High,2=Low
+                    action_map = {0:"Hold", 1:"High", 2:"Low"}
+                    action_str = action_map.get(action_idx, "Hold")
+                    
                 except Exception as e:
-                    print(f"[WARN] 非Torchモデル推論失敗: {e}")
+                    print(f"[WARN] モデル推論失敗: {e}")
                     reason = "predict_error"
                     _log_signal(current_time, current_price, phase, None, None, "Hold", False, reason)
                     time.sleep(TICK_INTERVAL_SECONDS)
                     continue
-                if action_idx is None:
-                    action_idx = int(np.argmax(q_values))
-                    action_map = {0:"Hold", 1:"High", 2:"Low"}
-                    action_str = action_map.get(action_idx, "Hold")
+            else:
+                reason = "unsupported_model"
+                print(f"[WARN] 非Torchモデルはサポートされていません")
+                _log_signal(current_time, current_price, phase, None, None, "Hold", False, reason)
+                time.sleep(TICK_INTERVAL_SECONDS)
+                continue
 
             # Decide entry: skip Hold
             if action_str == "Hold":
                 reason = "hold"
                 entry = False
+                print(f"[{current_time.strftime('%H:%M:%S')}] Hold - Q値: Hold={q_values[0]:.3f}, High={q_values[1]:.3f}, Low={q_values[2]:.3f}")
             else:
                 # optionally require q advantage over hold
-                if (q_values[action_idx] - q_values[0]) >= DQN_Q_MARGIN:
+                q_advantage = q_values[action_idx] - q_values[0]
+                if q_advantage >= DQN_Q_MARGIN:
                     # cooldown check
                     if next_entry_allowed_time and current_time < next_entry_allowed_time:
                         reason = "cooldown"
                         entry = False
+                        print(f"[{current_time.strftime('%H:%M:%S')}] {action_str} - クールダウン中 (残り{(next_entry_allowed_time-current_time).total_seconds():.1f}秒)")
                     else:
                         # execute entry
                         sel = '.invest-btn-up.button' if action_str == "High" else '.invest-btn-down.button'
@@ -506,10 +696,15 @@ with sync_playwright() as p:
                             next_entry_allowed_time = current_time + timedelta(seconds=ENTRY_COOLDOWN_SECONDS)
                             entry = True
                             reason = "entry_executed"
-                            print(f"[ENTRY] {action_str} at {current_time.strftime('%H:%M:%S')} price={current_price}")
+                            print(f"[ENTRY] {action_str} at {current_time.strftime('%H:%M:%S')} price={current_price} Q値: {q_values[action_idx]:.3f} (優位性: {q_advantage:.3f})")
                         else:
                             reason = "button_not_found"
                             entry = False
+                            print(f"[WARN] {action_str}ボタンが見つかりません")
+                else:
+                    reason = "insufficient_q_advantage"
+                    entry = False
+                    print(f"[{current_time.strftime('%H:%M:%S')}] {action_str} - Q値優位性不足 ({q_advantage:.3f} < {DQN_Q_MARGIN})")
 
             # log
             _log_signal(current_time, current_price, phase, q_values, action_idx, action_str, entry, reason)
