@@ -446,7 +446,6 @@ def train_dqn(ohlc_df, pair=pair, save_dir="./Models",
         phase = (sl.index[-1].second % 60)/60.0
         sec_range = float(sl['high'].iloc[-1] - sl['low'].iloc[-1])
         return build_state_vec(sl, [phase, sec_range], use_cache=False)
-    
     # 並列処理でサンプル準備
     with ThreadPoolExecutor(max_workers=num_workers) as executor:
         samples = list(executor.map(prepare_sample, sample_indices))

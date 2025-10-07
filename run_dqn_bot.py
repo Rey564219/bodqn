@@ -20,7 +20,10 @@ from datetime import datetime, timedelta
 from collections import deque
 
 # TA-lib (必要)
-import talib as ta
+try:
+    import talib as ta
+except ImportError:
+    import ta  # ta-libの代替ライブラリを使用
 
 # Playwright
 from playwright.sync_api import sync_playwright
@@ -38,7 +41,7 @@ MODEL_PT = f"./Models/dqn_policy_{pair}.pt"  # train_dqn.pyの保存形式に合
 MODEL_PKL = f"./Models/dqn_scaler_{pair}.pkl"  # スケーラーファイルも追加
 TICK_INTERVAL_SECONDS = 0.5
 CANDLE_TIMEFRAME = '1min'
-REQUIRED_CANDLES = 30  # 11から30に増加（より多くの履歴データ）
+REQUIRED_CANDLES = 12  # 11から30に増加（より多くの履歴データ）
 ENTRY_COOLDOWN_SECONDS = 25
 LOG_DIR = "./logs"
 LOG_PATH = os.path.join(LOG_DIR, f"live_signals_{pair}.csv")
@@ -201,8 +204,8 @@ def FeatureExtraction(df, use_cache=True):
             return _feature_cache[df_hash]
     
     df = df.copy()
-    periods_RSI = [14, 21]  # 期間を削減（計算量削減）
-    periods_SMA = [10, 20]  # 期間を削減（計算量削減）
+    periods_RSI = [14, 21]
+    periods_SMA = [10, 20]
 
     df = _CalcSMAR(df, periods_SMA)
     df = _CalcRSIR(df, periods_RSI)
@@ -212,11 +215,11 @@ def FeatureExtraction(df, use_cache=True):
     df["open_r"] = np.where(df["close"] != 0, df["open"]/df["close"], 1.0)
     df["high_r"] = np.where(df["close"] != 0, df["high"]/df["close"], 1.0)
     df["low_r"] = np.where(df["close"] != 0, df["low"]/df["close"], 1.0)
-    
+
     # 追加の特徴量 - ゼロ除算防止
     df["hl_ratio"] = np.where(df["close"] != 0, (df["high"] - df["low"]) / df["close"], 0.0)
     df["oc_ratio"] = np.where(df["close"] != 0, (df["open"] - df["close"]) / df["close"], 0.0)
-    
+
     # 移動平均との関係 - ゼロ除算防止
     for period in [5, 10, 20, 50]:
         if len(df) >= period:
@@ -225,47 +228,45 @@ def FeatureExtraction(df, use_cache=True):
             df[f"sma_distance_{period}"] = np.where(sma != 0, (df["close"] - sma) / sma, 0.0)
             df[f"ema_distance_{period}"] = np.where(ema != 0, (df["close"] - ema) / ema, 0.0)
             df[f"sma_ema_diff_{period}"] = np.where(ema != 0, (sma - ema) / ema, 0.0)
-    
+
     # 価格と移動平均の交差シグナル
     sma5 = df["close"].rolling(5).mean()
     sma20 = df["close"].rolling(20).mean()
-    df["golden_cross"] = np.where(sma5 > sma20, 1, 0)  # ゴールデンクロス
-    df["dead_cross"] = np.where(sma5 < sma20, 1, 0)    # デッドクロス
-    
+    df["golden_cross"] = np.where(sma5 > sma20, 1, 0)
+    df["dead_cross"] = np.where(sma5 < sma20, 1, 0)
+
     # 前の足との比較 - 異常値クリップ
     df["prev_close_ratio"] = df["close"].pct_change().clip(-1, 1)
     df["prev_volume_ratio"] = df["volume"].pct_change().clip(-10, 10) if "volume" in df.columns else 0
-    
+
     # 複数期間の価格変化率
     for lookback in [2, 3, 5]:
         df[f"price_change_{lookback}"] = df["close"].pct_change(lookback).clip(-1, 1)
-    
+
     # 高値・安値のブレイクアウトシグナル
     for period in [10, 20]:
         df[f"high_breakout_{period}"] = (df["high"] > df["high"].rolling(period).max().shift(1)).astype(int)
         df[f"low_breakout_{period}"] = (df["low"] < df["low"].rolling(period).min().shift(1)).astype(int)
-    
+
     result = df.drop(columns = ["open", "close", "high", "low", "volume"], errors='ignore')
-    
+
     # 異常値処理
-    result = result.replace([np.inf, -np.inf], np.nan)  # 無限大をNaNに変換
-    result = result.fillna(0)  # NaNを0で埋める
-    
-    # 異常に大きな値をクリップ
+    result = result.replace([np.inf, -np.inf], np.nan)
+    result = result.fillna(0)
+
     numeric_columns = result.select_dtypes(include=[np.number]).columns
     for col in numeric_columns:
-        # 99.9%分位点でクリップ
         upper_limit = result[col].quantile(0.999)
         lower_limit = result[col].quantile(0.001)
         result[col] = result[col].clip(lower=lower_limit, upper=upper_limit)
-    
+
     if use_cache:
         _feature_cache[df_hash] = result
-        # キャッシュサイズ制限
         if len(_feature_cache) > 10000:
-            # 古いキャッシュを削除
             oldest_key = next(iter(_feature_cache))
             del _feature_cache[oldest_key]
+
+    return result
     
     return result
 # -----------------------
@@ -380,50 +381,48 @@ def ticks_to_ohlc(ticks, timeframe_sec=60, max_bars=200):
 # DQN loader (flexible)
 # -----------------------
 class QNet(nn.Module):
-    def __init__(self, input_dim, output_dim=3):
+    def __init__(self, in_dim, out_dim):
         super().__init__()
-        # より深く、幅広いネットワークで表現力向上
+        # 保存されたモデルの正確な構造に合わせる
+        # 入力: 64次元, 隠れ層: 512-512-256, 出力ストリーム: 128
         self.feature_extractor = nn.Sequential(
-            nn.Linear(input_dim, 512),
+            nn.Linear(in_dim, 512),  # [512, 64] -> 入力64次元、出力512次元
             nn.LayerNorm(512),
-            nn.ReLU(inplace=True),
-            nn.Dropout(0.3),
-            
-            nn.Linear(512, 512),
-            nn.LayerNorm(512),
-            nn.ReLU(inplace=True),
-            nn.Dropout(0.3),
-            
-            nn.Linear(512, 256),
-            nn.LayerNorm(256),
             nn.ReLU(inplace=True),
             nn.Dropout(0.2),
+            
+            nn.Linear(512, 512),     # [512, 512]
+            nn.LayerNorm(512),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.2),
+            
+            nn.Linear(512, 256),     # [256, 512]
+            nn.LayerNorm(256),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.1),
         )
         
-        # 価値関数とアドバンテージ関数を分離（Dueling DQN）
+        # Value stream: 256 -> 128 -> 1
         self.value_stream = nn.Sequential(
-            nn.Linear(256, 128),
+            nn.Linear(256, 128),     # [128, 256]
             nn.ReLU(inplace=True),
-            nn.Linear(128, 1)
+            nn.Linear(128, 1)        # [1, 128]
         )
         
+        # Advantage stream: 256 -> 128 -> 3
         self.advantage_stream = nn.Sequential(
-            nn.Linear(256, 128),
+            nn.Linear(256, 128),     # [128, 256]
             nn.ReLU(inplace=True),
-            nn.Linear(128, output_dim)
+            nn.Linear(128, out_dim)  # [3, 128]
         )
     
-    def forward(self, x): 
+    def forward(self, x):
         features = self.feature_extractor(x)
-        
-        # Dueling DQN: Q(s,a) = V(s) + (A(s,a) - mean(A(s,a)))
         value = self.value_stream(features)
         advantage = self.advantage_stream(features)
         
-        # アドバンテージの正規化
-        advantage_mean = advantage.mean(dim=1, keepdim=True)
-        q_values = value + (advantage - advantage_mean)
-        
+        # Dueling DQN: Q(s,a) = V(s) + A(s,a) - mean(A(s,a))
+        q_values = value + advantage - advantage.mean(dim=1, keepdim=True)
         return q_values
 
 dqn_model = None
@@ -433,6 +432,7 @@ scaler = None  # スケーラーを追加
 def infer_feature_dim_for_model():
     # build a dummy OHLC window so FeatureExtraction can compute features
     try:
+        print("[DEBUG] Starting feature dimension inference...")
         N = max(50, REQUIRED_CANDLES + 20)  # より多くのサンプル
         idx = pd.date_range(end=datetime.now(), periods=N, freq='T')
         base = np.linspace(1.0, 1.0 + 0.001*N, N)
@@ -442,37 +442,67 @@ def infer_feature_dim_for_model():
             'low': base - 0.0005,
             'close': base
         }, index=idx)
+        print(f"[DEBUG] Created dummy data with shape: {dummy.shape}")
+        
         feat = FeatureExtraction(dummy)[-1:]
+        print(f"[DEBUG] Feature extraction result shape: {feat.shape}")
         print(f"[INFO] 推定特徴量次元: {feat.shape[1]} + 2 (phase, range) = {feat.shape[1] + 2}")
         return feat.shape[1]
     except Exception as e:
-        print(f"[WARN] 特徴量次元推定失敗: {e}")
+        print(f"[ERROR] 特徴量次元推定失敗: {e}")
+        import traceback
+        print(f"[DEBUG] Feature inference traceback:\n{traceback.format_exc()}")
         return 50  # より大きなfallback値
 
 # try torch .pt first
 if os.path.exists(MODEL_PT):
     try:
+        print(f"[DEBUG] Loading model from: {MODEL_PT}")
         ck = torch.load(MODEL_PT, map_location="cpu")
-        # if ck is dict with state dict
+        print(f"[DEBUG] Loaded object type: {type(ck)}")
+        
+        # train_dqn.pyは直接state_dictを保存している
+        # 保存されたモデルは64次元入力用
+        in_dim = 64  # 保存されたモデルの入力次元に固定
+        print(f"[DEBUG] Creating QNet with in_dim={in_dim}, out_dim=3")
+        qnet = QNet(in_dim, 3)
+        
         if isinstance(ck, dict) and ("model_state_dict" in ck or "state_dict" in ck):
-            feat_len = infer_feature_dim_for_model()
-            in_dim = feat_len + 2
-            qnet = QNet(in_dim, 3)
+            # 辞書形式の場合
+            print("[DEBUG] Dict with model_state_dict/state_dict detected")
             st = ck.get("model_state_dict", ck.get("state_dict"))
             qnet.load_state_dict(st)
+            print("[INFO] DQN (torch wrapped state_dict) ロード完了")
+        elif isinstance(ck, dict):
+            # 直接state_dictの場合（train_dqn.pyの保存形式）
+            print("[DEBUG] Direct state_dict detected")
+            print(f"[DEBUG] State dict keys: {list(ck.keys())[:5]}...")  # 最初の5つのキーを表示
+            qnet.load_state_dict(ck)
+            print("[INFO] DQN (torch direct state_dict) ロード完了")
+        elif isinstance(ck, nn.Module):
+            # モジュール全体が保存されている場合
+            print("[DEBUG] PyTorch module detected")
+            qnet = ck
+            print("[INFO] DQN (torch module) ロード完了")
+        else:
+            print(f"[ERROR] MODEL_PT 読込はしたが形式不明: {type(ck)}")
+            if hasattr(ck, '__dict__'):
+                print(f"[DEBUG] Object attributes: {list(vars(ck).keys())}")
+            qnet = None
+        
+        if qnet is not None:
             qnet.eval()
             dqn_model = qnet
             dqn_is_torch = True
-            print("[INFO] DQN (torch state_dict) ロード完了")
-        elif isinstance(ck, nn.Module):
-            dqn_model = ck
-            dqn_is_torch = True
-            print("[INFO] DQN (torch module) ロード完了")
-        else:
-            # maybe saved plain tensor or other - fallback to try pickle path below
-            print("[WARN] MODEL_PT 読込はしたが形式不明、pickleを試行します")
+            print(f"[INFO] Model successfully loaded and set to eval mode")
+        
     except Exception as e:
-        print(f"[WARN] torch load 失敗: {e} - pickleを試行します")
+        print(f"[ERROR] torch load 失敗: {e}")
+        import traceback
+        print(f"[DEBUG] Full traceback:\n{traceback.format_exc()}")
+        dqn_model = None
+else:
+    print(f"[ERROR] Model file not found: {MODEL_PT}")
 
 # Load scaler
 try:
@@ -484,10 +514,18 @@ except Exception as e:
     scaler = None
 
 if dqn_model is None:
-    print("[WARN] DQNモデルが見つかりません。予測はスキップされます。")
+    print("[ERROR] DQNモデルが見つかりません。予測はスキップされます。")
+    print(f"[DEBUG] MODEL_PT: {MODEL_PT}")
+    print(f"[DEBUG] ファイル存在: {os.path.exists(MODEL_PT)}")
+else:
+    print(f"[INFO] DQNモデル読み込み成功 - PyTorch: {dqn_is_torch}")
 
 if scaler is None:
-    print("[WARN] スケーラーが見つかりません。特徴量の正規化ができません。")
+    print("[ERROR] スケーラーが見つかりません。特徴量の正規化ができません。")
+    print(f"[DEBUG] MODEL_PKL: {MODEL_PKL}")
+    print(f"[DEBUG] ファイル存在: {os.path.exists(MODEL_PKL)}")
+else:
+    print("[INFO] スケーラー読み込み成功")
 
 # -----------------------
 # ログ関数 (q値とactionを記録)
@@ -726,4 +764,3 @@ with sync_playwright() as p:
             all_ticks = []
             time.sleep(TICK_INTERVAL_SECONDS)
 
-# end
