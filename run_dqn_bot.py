@@ -20,10 +20,87 @@ from datetime import datetime, timedelta
 from collections import deque
 
 # TA-lib (必要)
+ta = None
 try:
     import talib as ta
+    print("[INFO] TA-lib (talib) loaded successfully")
 except ImportError:
-    import ta  # ta-libの代替ライブラリを使用
+    try:
+        import ta
+        print("[INFO] TA-lib alternative (ta) loaded successfully")
+    except ImportError:
+        print("[WARN] TA-lib not available. Using basic calculations...")
+        # TA-lib関数のモック版を作成
+        class MockTA:
+            @staticmethod
+            def EMA(close, period):
+                return close.ewm(span=period).mean()
+            
+            @staticmethod
+            def RSI(close, period):
+                delta = close.diff()
+                gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+                loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+                rs = gain / loss
+                return 100 - (100 / (1 + rs))
+            
+            @staticmethod
+            def BBANDS(close, period, nbdevup=2, nbdevdn=2, matype=0):
+                ma = close.rolling(period).mean()
+                std = close.rolling(period).std()
+                upper = ma + (std * nbdevup)
+                lower = ma - (std * nbdevdn)
+                return upper, ma, lower
+                
+            @staticmethod
+            def ATR(high, low, close, period):
+                tr1 = high - low
+                tr2 = abs(high - close.shift())
+                tr3 = abs(low - close.shift())
+                tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+                return tr.rolling(period).mean()
+                
+            @staticmethod
+            def MOM(close, period):
+                return close.diff(period)
+                
+            @staticmethod
+            def STOCH(high, low, close, period):
+                lowest_low = low.rolling(period).min()
+                highest_high = high.rolling(period).max()
+                k_percent = 100 * ((close - lowest_low) / (highest_high - lowest_low))
+                d_percent = k_percent.rolling(3).mean()
+                return k_percent, d_percent
+                
+            @staticmethod
+            def MACD(close, fastperiod=12, slowperiod=26, signalperiod=9):
+                exp1 = close.ewm(span=fastperiod).mean()
+                exp2 = close.ewm(span=slowperiod).mean()
+                macd = exp1 - exp2
+                signal = macd.ewm(span=signalperiod).mean()
+                histogram = macd - signal
+                return macd, signal, histogram
+                
+            @staticmethod
+            def WILLR(high, low, close, period):
+                highest_high = high.rolling(period).max()
+                lowest_low = low.rolling(period).min()
+                wr = -100 * ((highest_high - close) / (highest_high - lowest_low))
+                return wr
+                
+            @staticmethod
+            def CCI(high, low, close, period):
+                tp = (high + low + close) / 3
+                sma = tp.rolling(period).mean()
+                mad = tp.rolling(period).apply(lambda x: abs(x - x.mean()).mean())
+                cci = (tp - sma) / (0.015 * mad)
+                return cci
+                
+            @staticmethod
+            def ROC(close, period=10):
+                return ((close - close.shift(period)) / close.shift(period)) * 100
+        
+        ta = MockTA()
 
 # Playwright
 from playwright.sync_api import sync_playwright
@@ -62,6 +139,7 @@ DQN_Q_MARGIN = 0.0  # Holdとの差でエントリーを抑制したければ正
 # -----------------------
 # FeatureExtraction（既存ロジック準拠）
 # -----------------------
+
 def _CalcSMAR(df,periods):
     for period in periods:
         ema = ta.EMA(df["close"], period)
@@ -75,60 +153,13 @@ def _CalcRSIR(df,periods):
         df["RSIR_diff_"+str(period)] = df["RSIR_"+str(period)].diff()
     return df
 def _CalcOtherR(df, periods):
-    # 大量データの場合、計算する期間を制限
-    if len(df) > 100:
-        # 最後の部分のみ計算（効率化）
-        calc_df = df.iloc[-min(500, len(df)):].copy()  # 最大500行まで
-        
-        for period in periods:
-            if len(calc_df) < period:
-                continue  # 期間が不足している場合はスキップ
-                
-            # ボリンジャーバンド幅
-            try:
-                upper, middle, lower = ta.BBANDS(calc_df['close'], period)
-                calc_df['bb_width'+str(period)] = upper - lower
-                calc_df['bb_width_diff' + str(period)] = calc_df['bb_width'+str(period)].diff()
-                
-                # ボリンジャーバンドの位置（%B）- ゼロ除算防止
-                width = upper - lower
-                calc_df['bb_percent'+str(period)] = np.where(width != 0, (calc_df['close'] - lower) / width, 0.5)
-                
-                # ATR（平均的な値幅）
-                calc_df['atr'+str(period)] = ta.ATR(calc_df['high'], calc_df['low'], calc_df['close'], period)
-                calc_df['atr_diff' + str(period)] = calc_df['atr'+str(period)].diff()
-                
-                # 価格変動率 - 異常値防止
-                calc_df['price_change'+str(period)] = calc_df['close'].pct_change(period).clip(-1, 1)
-                
-                # ボラティリティ
-                calc_df['volatility'+str(period)] = calc_df['close'].rolling(period).std()
-                
-                # 新しい特徴量：価格の勢い（軽量版）
-                calc_df['momentum'+str(period)] = ta.MOM(calc_df['close'], period)
-                calc_df['momentum_norm'+str(period)] = calc_df['momentum'+str(period)] / calc_df['close']
-                
-                # 価格の位置（高値・安値に対する相対位置）
-                high_max = calc_df['high'].rolling(period).max()
-                low_min = calc_df['low'].rolling(period).min()
-                calc_df['high_pos'+str(period)] = (calc_df['close'] - low_min) / (high_max - low_min + 1e-8)
-                
-            except Exception as e:
-                print(f"[WARNING] Error calculating period {period}: {e}")
-                continue
-        
-        # 元のデータフレームに結果を統合（最後の行のみ）
-        for col in calc_df.columns:
-            if col not in df.columns:
-                df[col] = np.nan
-                df.iloc[-1, df.columns.get_loc(col)] = calc_df.iloc[-1][col]
-    else:
-        # 小さなデータの場合は通常の計算
-        for period in periods:
-            if len(df) < period:
-                continue
-                
-            # ボリンジャーバンド幅
+    # 全データで計算するように変更
+    for period in periods:
+        if len(df) < period:
+            continue
+            
+        # ボリンジャーバンド幅
+        try:
             upper, middle, lower = ta.BBANDS(df['close'], period)
             df['bb_width'+str(period)] = upper - lower
             df['bb_width_diff' + str(period)] = df['bb_width'+str(period)].diff()
@@ -149,12 +180,16 @@ def _CalcOtherR(df, periods):
             
             # 新しい特徴量：価格の勢い
             df['momentum'+str(period)] = ta.MOM(df['close'], period)
-            df['momentum_norm'+str(period)] = df['momentum'+str(period)] / df['close']
+            df['momentum_norm'+str(period)] = df['momentum'+str(period)] / (df['close'] + 1e-8)
             
             # 価格の位置（高値・安値に対する相対位置）
             high_max = df['high'].rolling(period).max()
             low_min = df['low'].rolling(period).min()
             df['high_pos'+str(period)] = (df['close'] - low_min) / (high_max - low_min + 1e-8)
+            
+        except Exception as e:
+            print(f"[WARNING] Error calculating period {period}: {e}")
+            continue
     
     # より軽量な技術指標のみ計算
     try:
@@ -192,6 +227,8 @@ def _CalcOtherR(df, periods):
             df[col] = df[col].ffill().fillna(0)  # 新しい記法に変更
     
     return df
+    
+    return df
 
 # 特徴量計算のキャッシュを追加
 _feature_cache = {}
@@ -204,8 +241,8 @@ def FeatureExtraction(df, use_cache=True):
             return _feature_cache[df_hash]
     
     df = df.copy()
-    periods_RSI = [14, 21]
-    periods_SMA = [10, 20]
+    periods_RSI = [14, 21]  # 期間を削減（計算量削減）
+    periods_SMA = [10, 20]  # 期間を削減（計算量削減）
 
     df = _CalcSMAR(df, periods_SMA)
     df = _CalcRSIR(df, periods_RSI)
@@ -215,11 +252,11 @@ def FeatureExtraction(df, use_cache=True):
     df["open_r"] = np.where(df["close"] != 0, df["open"]/df["close"], 1.0)
     df["high_r"] = np.where(df["close"] != 0, df["high"]/df["close"], 1.0)
     df["low_r"] = np.where(df["close"] != 0, df["low"]/df["close"], 1.0)
-
+    
     # 追加の特徴量 - ゼロ除算防止
     df["hl_ratio"] = np.where(df["close"] != 0, (df["high"] - df["low"]) / df["close"], 0.0)
     df["oc_ratio"] = np.where(df["close"] != 0, (df["open"] - df["close"]) / df["close"], 0.0)
-
+    
     # 移動平均との関係 - ゼロ除算防止
     for period in [5, 10, 20, 50]:
         if len(df) >= period:
@@ -228,47 +265,77 @@ def FeatureExtraction(df, use_cache=True):
             df[f"sma_distance_{period}"] = np.where(sma != 0, (df["close"] - sma) / sma, 0.0)
             df[f"ema_distance_{period}"] = np.where(ema != 0, (df["close"] - ema) / ema, 0.0)
             df[f"sma_ema_diff_{period}"] = np.where(ema != 0, (sma - ema) / ema, 0.0)
-
+    
     # 価格と移動平均の交差シグナル
     sma5 = df["close"].rolling(5).mean()
     sma20 = df["close"].rolling(20).mean()
-    df["golden_cross"] = np.where(sma5 > sma20, 1, 0)
-    df["dead_cross"] = np.where(sma5 < sma20, 1, 0)
-
+    df["golden_cross"] = np.where(sma5 > sma20, 1, 0)  # ゴールデンクロス
+    df["dead_cross"] = np.where(sma5 < sma20, 1, 0)    # デッドクロス
+    
     # 前の足との比較 - 異常値クリップ
     df["prev_close_ratio"] = df["close"].pct_change().clip(-1, 1)
     df["prev_volume_ratio"] = df["volume"].pct_change().clip(-10, 10) if "volume" in df.columns else 0
-
+    
     # 複数期間の価格変化率
     for lookback in [2, 3, 5]:
         df[f"price_change_{lookback}"] = df["close"].pct_change(lookback).clip(-1, 1)
-
+    
     # 高値・安値のブレイクアウトシグナル
     for period in [10, 20]:
         df[f"high_breakout_{period}"] = (df["high"] > df["high"].rolling(period).max().shift(1)).astype(int)
         df[f"low_breakout_{period}"] = (df["low"] < df["low"].rolling(period).min().shift(1)).astype(int)
-
+    
     result = df.drop(columns = ["open", "close", "high", "low", "volume"], errors='ignore')
-
+    
     # 異常値処理
-    result = result.replace([np.inf, -np.inf], np.nan)
-    result = result.fillna(0)
-
+    result = result.replace([np.inf, -np.inf], np.nan)  # 無限大をNaNに変換
+    result = result.fillna(0)  # NaNを0で埋める
+    
+    # デバッグ: 特徴量の確認
+    print(f"[DEBUG] drop前の列数: {len(df.columns)}")
+    print(f"[DEBUG] drop後の列数: {len(result.columns)}")
+    print(f"[DEBUG] 最初の10列: {list(result.columns[:10])}")
+    print(f"[DEBUG] 最後の10列: {list(result.columns[-10:])}")
+    
+    # 異常値処理
+    result = result.replace([np.inf, -np.inf], np.nan)  # 無限大をNaNに変換
+    result = result.fillna(0)  # NaNを0で埋める
+    
+    # 異常に大きな値をクリップ
     numeric_columns = result.select_dtypes(include=[np.number]).columns
     for col in numeric_columns:
+        # 99.9%分位点でクリップ
         upper_limit = result[col].quantile(0.999)
         lower_limit = result[col].quantile(0.001)
         result[col] = result[col].clip(lower=lower_limit, upper=upper_limit)
-
+    
+    # 最後の行のみを抽出して、正確に62次元に調整
+    feature_row = result.iloc[-1:].copy()
+    
+    # 62次元を確保
+    if len(feature_row.columns) > 62:
+        # 最初の62列のみを選択
+        feature_row = feature_row.iloc[:, :62]
+        print(f"[INFO] 特徴量を62次元に削減 (元: {len(result.columns)})")
+    elif len(feature_row.columns) < 62:
+        # 不足分を0で補完
+        missing = 62 - len(feature_row.columns)
+        for i in range(missing):
+            feature_row[f"pad_{i}"] = 0.0
+        print(f"[INFO] 特徴量を62次元に補完 (元: {len(result.columns)})")
+    
+    print(f"[DEBUG] 最終特徴量数: {len(feature_row.columns)}")
+    
     if use_cache:
-        _feature_cache[df_hash] = result
+        _feature_cache[df_hash] = feature_row
+        # キャッシュサイズ制限
         if len(_feature_cache) > 10000:
+            # 古いキャッシュを削除
             oldest_key = next(iter(_feature_cache))
             del _feature_cache[oldest_key]
-
-    return result
     
-    return result
+    return feature_row
+
 # -----------------------
 # human-like 操作関数 (Playwright用)
 # -----------------------
@@ -306,38 +373,135 @@ def human_type(element, text):
             print(f"[ERROR] fallback fill 失敗: {e2}")
 
 def try_close_popups(page):
+    """ポップアップ・広告・モーダルを確実に閉じる"""
     try:
-        # hide chat iframe
-        chat_iframe = page.query_selector("iframe.intercom-with-namespace-vo6dyv")
-        if chat_iframe:
-            try:
-                page.evaluate("iframe => iframe.style.display = 'none'", chat_iframe)
-            except Exception:
-                pass
-        selectors = [
-            ".modal-close", ".close", ".modal-header .close", ".modal .btn-close",
-            "button[aria-label='Close']", "button[aria-label='閉じる']",
-            ".ant-modal-close", ".Toastify__toast button[aria-label='close']"
+        print("[INFO] ポップアップ・広告の閉じ処理を開始...")
+        
+        # 1. チャットウィジェットを無効化
+        try:
+            page.evaluate("""
+                // Intercomチャットを非表示
+                const chatIframes = document.querySelectorAll('iframe[title*="Intercom"], iframe.intercom-with-namespace-vo6dyv');
+                chatIframes.forEach(iframe => {
+                    iframe.style.display = 'none';
+                    iframe.style.visibility = 'hidden';
+                });
+                
+                // チャットコンテナも非表示
+                const chatContainers = document.querySelectorAll('#intercom-container, .intercom-namespace');
+                chatContainers.forEach(container => {
+                    container.style.display = 'none';
+                    container.style.visibility = 'hidden';
+                });
+            """)
+            print("[INFO] チャットウィジェット無効化完了")
+        except Exception as e:
+            print(f"[WARN] チャット無効化失敗: {e}")
+        
+        # 2. 共通的な閉じるボタンを探して実行
+        close_selectors = [
+            # 標準的な閉じるボタン
+            "button[aria-label='Close']",
+            "button[aria-label='閉じる']", 
+            "button[title='Close']",
+            ".close",
+            ".modal-close",
+            ".popup-close",
+            ".dialog-close",
+            
+            # 特定のライブラリ
+            ".ant-modal-close",
+            ".ant-modal-close-x",
+            ".ant-drawer-close",
+            ".el-dialog__close",
+            ".el-message-box__close",
+            
+            # Toast/通知
+            ".Toastify__close-button",
+            ".toast-close",
+            ".notification-close",
+            
+            # その他
+            "[data-dismiss='modal']",
+            "[data-bs-dismiss='modal']",
+            ".btn-close"
         ]
-        for sel in selectors:
-            for btn in page.query_selector_all(sel):
+        
+        closed_count = 0
+        for selector in close_selectors:
+            elements = page.query_selector_all(selector)
+            for element in elements:
                 try:
-                    human_click(btn, page)
+                    if element.is_visible():
+                        element.click(force=True)
+                        closed_count += 1
+                        time.sleep(0.1)
                 except Exception:
                     pass
-        overlay_selectors = ".modal-backdrop, .overlay, .ant-modal-wrap, .ant-drawer-mask"
-        for ov in page.query_selector_all(overlay_selectors):
-            try:
-                human_click(ov, page)
-            except Exception:
-                pass
-        # ESC
+        
+        if closed_count > 0:
+            print(f"[INFO] {closed_count}個のポップアップを閉じました")
+        
+        # 3. モーダルオーバーレイを直接クリック
+        overlay_selectors = [
+            ".modal-backdrop",
+            ".overlay", 
+            ".ant-modal-wrap",
+            ".ant-drawer-mask",
+            ".el-overlay",
+            ".v-overlay__scrim"
+        ]
+        
+        for selector in overlay_selectors:
+            elements = page.query_selector_all(selector)
+            for element in elements:
+                try:
+                    if element.is_visible():
+                        element.click(force=True)
+                        time.sleep(0.1)
+                except Exception:
+                    pass
+        
+        # 4. Escapeキーを押す
         try:
             page.keyboard.press("Escape")
+            time.sleep(0.2)
         except Exception:
             pass
+        
+        # 5. JavaScript実行で強制的にポップアップを削除
+        try:
+            page.evaluate("""
+                // 固定位置の要素（ポップアップの可能性）を削除
+                const fixedElements = document.querySelectorAll('*');
+                fixedElements.forEach(el => {
+                    const style = window.getComputedStyle(el);
+                    if (style.position === 'fixed' && 
+                        (style.zIndex > 1000 || el.classList.contains('modal') || 
+                         el.classList.contains('popup') || el.classList.contains('dialog'))) {
+                        el.style.display = 'none';
+                    }
+                });
+                
+                // 既知の広告・ポップアップクラスを削除
+                const adSelectors = [
+                    '.advertisement', '.ad-banner', '.popup', '.modal', 
+                    '.overlay', '.lightbox', '.dialog', '.notification'
+                ];
+                adSelectors.forEach(selector => {
+                    document.querySelectorAll(selector).forEach(el => {
+                        if (el.style.zIndex > 100) el.style.display = 'none';
+                    });
+                });
+            """)
+            print("[INFO] JavaScript強制削除完了")
+        except Exception as e:
+            print(f"[WARN] JavaScript削除失敗: {e}")
+        
+        print("[INFO] ポップアップ閉じ処理完了")
+        
     except Exception as e:
-        print(f"[WARN] ポップアップ消去処理でエラー: {e}")
+        print(f"[ERROR] ポップアップ処理でエラー: {e}")
 
 def ensure_session(page, email, passward):
     try:
@@ -346,11 +510,35 @@ def ensure_session(page, email, passward):
             return False
         # login form present -> attempt re-login
         print("[INFO] ログインフォーム検出 -> 再ログイン実施")
-        inputs = page.query_selector_all('.form-control.lg-input')
-        if len(inputs) >= 2:
-            human_type(inputs[0], email)
-            human_type(inputs[1], passward)
-        human_click(login_btn, page)
+        try:
+            # メールアドレス入力
+            email_input = page.query_selector('input[type="email"]') or page.query_selector('input[name="email"]') or page.query_selector('.form-control.lg-input')
+            if email_input:
+                email_input.clear()
+                email_input.type(email, delay=50)
+            
+            # パスワード入力  
+            password_input = page.query_selector('input[type="password"]') or page.query_selector('input[name="password"]')
+            if not password_input:
+                inputs = page.query_selector_all('.form-control.lg-input')
+                if len(inputs) >= 2:
+                    password_input = inputs[1]
+            
+            if password_input:
+                password_input.clear()
+                password_input.type(passward, delay=50)
+            
+            # ログインボタンクリック
+            login_btn.click()
+            
+        except Exception as e:
+            print(f"[WARN] Standard login failed, using fallback: {e}")
+            # フォールバック: 従来の方法
+            inputs = page.query_selector_all('.form-control.lg-input')
+            if len(inputs) >= 2:
+                inputs[0].fill(email)
+                inputs[1].fill(passward)
+            login_btn.click()
         try:
             page.wait_for_selector('.strikeWrapper div', timeout=3000)
         except Exception:
@@ -568,14 +756,44 @@ with sync_playwright() as p:
     time.sleep(10)
     try_close_popups(page)
 
-    # ログイン (human-like)
-    inputs = page.query_selector_all('.form-control.lg-input')
-    if len(inputs) >= 2:
-        human_type(inputs[0], email)
-        human_type(inputs[1], passward)
-    login_btn = page.query_selector('#btnSubmit')
-    if login_btn:
-        human_click(login_btn, page)
+    # ログイン (simple and stable)
+    time.sleep(2)
+    try:
+        # メールアドレス入力
+        email_input = page.query_selector('input[type="email"]') or page.query_selector('input[name="email"]') or page.query_selector('.form-control.lg-input')
+        if email_input:
+            email_input.clear()
+            email_input.type(email, delay=100)
+            print(f"[INFO] Email entered: {email}")
+        
+        # パスワード入力  
+        password_input = page.query_selector('input[type="password"]') or page.query_selector('input[name="password"]')
+        if not password_input:
+            inputs = page.query_selector_all('.form-control.lg-input')
+            if len(inputs) >= 2:
+                password_input = inputs[1]
+        
+        if password_input:
+            password_input.clear()
+            password_input.type(passward, delay=100)
+            print(f"[INFO] Password entered")
+        
+        # ログインボタンクリック
+        login_btn = page.query_selector('#btnSubmit') or page.query_selector('button[type="submit"]') or page.query_selector('.btn-primary')
+        if login_btn:
+            login_btn.click()
+            print(f"[INFO] Login button clicked")
+        
+    except Exception as e:
+        print(f"[ERROR] Login process failed: {e}")
+        # フォールバック: 従来の方法
+        inputs = page.query_selector_all('.form-control.lg-input')
+        if len(inputs) >= 2:
+            inputs[0].fill(email)
+            inputs[1].fill(passward)
+            login_btn = page.query_selector('#btnSubmit')
+            if login_btn:
+                login_btn.click()
     try:
         page.wait_for_selector(".strikeWrapper div", timeout=20000)
     except Exception:
@@ -643,15 +861,19 @@ with sync_playwright() as p:
             try:
                 fea_ohlc = ohlc_data[['open','high','low','close']].copy()
                 feats_df = FeatureExtraction(fea_ohlc)
-                # take last row
+                # take last row - should be 62 dimensions
                 feat_row = feats_df.iloc[-1].values.astype(np.float32)
-                # second extra: range of last candle
+                print(f"[DEBUG] FeatureExtraction output shape: {feat_row.shape}")
+                
+                # Add phase and sec_range to make 64 dimensions total
                 sec_range = float(fea_ohlc['high'].iloc[-1] - fea_ohlc['low'].iloc[-1])
                 feat_vec = np.concatenate([feat_row, np.asarray([phase, sec_range], dtype=np.float32)])
+                print(f"[DEBUG] Final feature vector shape: {feat_vec.shape}")
                 
                 # 特徴量の正規化（スケーラーがある場合）
                 if scaler is not None:
                     feat_vec = scaler.transform([feat_vec])[0].astype(np.float32)
+                    print(f"[DEBUG] Scaled feature vector shape: {feat_vec.shape}")
             except Exception as e:
                 print(f"[WARN] 特徴量抽出エラー: {e}")
                 time.sleep(TICK_INTERVAL_SECONDS)
