@@ -1,8 +1,18 @@
 # train_dqn.py
-import os, pickle, random, math
+import os
+
+# PyTorchのDynamo機能を無効化（最優先で設定）
+os.environ['TORCH_DYNAMO_DISABLE'] = '1'
+os.environ['TORCH_DISABLE_DYNAMIC_SHAPES'] = '1'
+os.environ['PYTORCH_DISABLE_DYNAMO'] = '1'
+os.environ['TORCH_COMPILE_DISABLE'] = '1'
+
+import pickle, random, math
 import numpy as np
 import pandas as pd
+
 import torch, torch.nn as nn, torch.optim as optim
+
 from collections import deque
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
@@ -14,7 +24,7 @@ import torch.nn.functional as F
 from concurrent.futures import ThreadPoolExecutor
 import multiprocessing as mp
 
-pair = "USDJPY"
+pair = "BTCUSD"
 def _CalcSMAR(df,periods):
     for period in periods:
         ema = ta.EMA(df["close"], period)
@@ -475,9 +485,56 @@ def train_dqn(ohlc_df, pair=pair, save_dir="./Models",
     q.train()  # 学習モード
     tgt.eval()  # ターゲットは常に評価モード
     
-    # 最適化アルゴリズムを改善
-    opt = optim.AdamW(q.parameters(), lr=lr, weight_decay=1e-5)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(opt, T_max=updates)
+    # 最適化アルゴリズム（手動実装でPyTorchの問題を完全回避）
+    print("[INFO] Initializing custom optimizer to avoid PyTorch issues...")
+    
+    # パラメータを手動で管理
+    params = list(q.parameters())
+    param_count = sum(p.numel() for p in params)
+    print(f"[INFO] Model has {param_count:,} parameters")
+    
+    # 手動Adam実装用の状態
+    adam_state = {
+        'step': 0,
+        'm': [torch.zeros_like(p) for p in params],  # 1次モーメント
+        'v': [torch.zeros_like(p) for p in params],  # 2次モーメント
+        'lr': lr,
+        'beta1': 0.9,
+        'beta2': 0.999,
+        'eps': 1e-8,
+        'weight_decay': 1e-5
+    }
+    
+    def manual_adam_step():
+        adam_state['step'] += 1
+        bias_correction1 = 1 - adam_state['beta1'] ** adam_state['step']
+        bias_correction2 = 1 - adam_state['beta2'] ** adam_state['step']
+        
+        # コサインアニーリングによる学習率調整
+        progress = adam_state['step'] / updates
+        current_lr = lr * 0.5 * (1 + math.cos(math.pi * progress))
+        adam_state['lr'] = current_lr
+        
+        for i, param in enumerate(params):
+            if param.grad is None:
+                continue
+                
+            grad = param.grad.data
+            if adam_state['weight_decay'] != 0:
+                grad = grad.add(param.data, alpha=adam_state['weight_decay'])
+            
+            # 1次および2次モーメントの更新
+            adam_state['m'][i].mul_(adam_state['beta1']).add_(grad, alpha=1 - adam_state['beta1'])
+            adam_state['v'][i].mul_(adam_state['beta2']).addcmul_(grad, grad, value=1 - adam_state['beta2'])
+            
+            # バイアス補正
+            m_hat = adam_state['m'][i] / bias_correction1
+            v_hat = adam_state['v'][i] / bias_correction2
+            
+            # パラメータ更新
+            param.data.addcdiv_(m_hat, v_hat.sqrt().add_(adam_state['eps']), value=-adam_state['lr'])
+    
+    print("[INFO] Custom Adam optimizer initialized successfully")
     
     mem = Replay()
 
@@ -681,11 +738,13 @@ def train_dqn(ohlc_df, pair=pair, save_dir="./Models",
                     
                     mem.update_priorities(indices, td_errors)
                     
-                    opt.zero_grad()
+                    # 手動optimizer実行
+                    for param in q.parameters():
+                        if param.grad is not None:
+                            param.grad.zero_()
                     loss.backward()
                     torch.nn.utils.clip_grad_norm_(q.parameters(), max_norm=1.0)
-                    opt.step()
-                    scheduler.step()
+                    manual_adam_step()
                     
                     if steps % target_sync == 0:
                         tgt.load_state_dict(q.state_dict())
