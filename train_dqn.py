@@ -366,7 +366,7 @@ def compute_reward(entry_action, next_close, entry_price):
     price_diff = abs(next_close - entry_price) / entry_price
     direction_correct = False
     
-    # より細かい報酬設計
+    # より細かい報酬設計（High/Low偏り修正）
     if entry_action == 1:  # High予測
         direction_correct = next_close > entry_price
         price_change = (next_close - entry_price) / entry_price
@@ -376,27 +376,27 @@ def compute_reward(entry_action, next_close, entry_price):
     else:
         return 0.0
     
-    # 基本報酬計算
+    # 基本報酬計算（High/Low同等に調整）
     if direction_correct:
-        # 成功時：段階的報酬
+        # 成功時：段階的報酬（High/Low同じスケール）
         if price_diff > 0.002:  # 20pips以上の大幅な動き
-            base_reward = 3.0
+            base_reward = 2.5  # 3.0→2.5に調整
         elif price_diff > 0.001:  # 10pips以上の中程度の動き
-            base_reward = 2.0
+            base_reward = 1.8  # 2.0→1.8に調整
         elif price_diff > 0.0005:  # 5pips以上の小さな動き
-            base_reward = 1.0
+            base_reward = 1.2  # 1.0→1.2に調整
         else:  # 5pips未満の微小な動き
-            base_reward = 0.5
+            base_reward = 0.6  # 0.5→0.6に調整
         
-        # 価格変動に比例したボーナス
-        momentum_bonus = min(price_change * 5000, 2.0)  # 最大2.0のボーナス
+        # 価格変動に比例したボーナス（High/Low同等）
+        momentum_bonus = min(abs(price_change) * 3000, 1.5)  # 5000→3000、2.0→1.5に調整
         return base_reward + momentum_bonus
     else:
-        # 失敗時：段階的ペナルティ
+        # 失敗時：段階的ペナルティ（High/Low同等）
         if price_diff > 0.002:  # 大幅な逆行
-            penalty = -2.5
+            penalty = -2.0  # -2.5→-2.0に調整
         elif price_diff > 0.001:  # 中程度の逆行
-            penalty = -1.5
+            penalty = -1.3  # -1.5→-1.3に調整
         elif price_diff > 0.0005:  # 小さな逆行
             penalty = -1.0
         else:  # 微小な逆行
@@ -536,6 +536,10 @@ def train_dqn(ohlc_df, pair=pair, save_dir="./Models",
     # 学習統計
     loss_history = deque(maxlen=1000)
     reward_history = deque(maxlen=1000)
+    
+    # エントリー統計
+    entry_stats = {'Hold': 0, 'High': 0, 'Low': 0}
+    reward_stats = {'Hold': [], 'High': [], 'Low': []}
 
     print("[INFO] Starting training...")
     
@@ -603,6 +607,12 @@ def train_dqn(ohlc_df, pair=pair, save_dir="./Models",
                 next_close = float(ohlc_df['close'].iloc[i+1])
                 r = compute_reward(a, next_close, entry_price)
                 reward_history.append(r)
+                
+                # 統計記録
+                action_names = ['Hold', 'High', 'Low']
+                if 0 <= a < len(action_names):
+                    entry_stats[action_names[a]] += 1
+                    reward_stats[action_names[a]].append(r)
                 
                 # 次の状態（事前計算済み、またはその場で計算）
                 if i+1 in pre_computed_states:
@@ -692,11 +702,26 @@ def train_dqn(ohlc_df, pair=pair, save_dir="./Models",
             avg_loss = np.mean(loss_history) if loss_history else 0.0
             avg_reward = np.mean(reward_history) if reward_history else 0.0
             
+            # エントリー統計の計算
+            total_entries = sum(entry_stats.values())
+            hold_pct = (entry_stats['Hold'] / total_entries * 100) if total_entries > 0 else 0
+            high_pct = (entry_stats['High'] / total_entries * 100) if total_entries > 0 else 0
+            low_pct = (entry_stats['Low'] / total_entries * 100) if total_entries > 0 else 0
+            
+            # 各アクションの平均報酬
+            avg_reward_hold = np.mean(reward_stats['Hold']) if reward_stats['Hold'] else 0.0
+            avg_reward_high = np.mean(reward_stats['High']) if reward_stats['High'] else 0.0
+            avg_reward_low = np.mean(reward_stats['Low']) if reward_stats['Low'] else 0.0
+            
             torch.save(q.state_dict(), os.path.join(save_dir, f"dqn_policy_{pair}.pt"))
             with open(os.path.join(save_dir, f"dqn_scaler_{pair}.pkl"), "wb") as f:
                 pickle.dump(scaler, f)
             print(f"[CKPT] Episode={episode}, Steps={steps}, Eps={eps:.3f}, "
                   f"AvgLoss={avg_loss:.4f}, AvgReward={avg_reward:.4f}")
+            print(f"[STATS] エントリー回数 - Hold:{entry_stats['Hold']}({hold_pct:.1f}%), "
+                  f"High:{entry_stats['High']}({high_pct:.1f}%), Low:{entry_stats['Low']}({low_pct:.1f}%)")
+            print(f"[REWARDS] 平均報酬 - Hold:{avg_reward_hold:.3f}, "
+                  f"High:{avg_reward_high:.3f}, Low:{avg_reward_low:.3f}")
             
             # メモリ使用量をチェック（デバッグ用）
             if device.startswith('cuda'):
@@ -706,6 +731,25 @@ def train_dqn(ohlc_df, pair=pair, save_dir="./Models",
     torch.save(q.state_dict(), os.path.join(save_dir, f"dqn_policy_{pair}.pt"))
     with open(os.path.join(save_dir, f"dqn_scaler_{pair}.pkl"), "wb") as f:
         pickle.dump(scaler, f)
+    
+    # 最終統計表示
+    total_entries = sum(entry_stats.values())
+    if total_entries > 0:
+        print("\n" + "="*60)
+        print("FINAL TRAINING STATISTICS")
+        print("="*60)
+        print(f"Total Actions: {total_entries}")
+        print(f"Hold: {entry_stats['Hold']} ({entry_stats['Hold']/total_entries*100:.1f}%)")
+        print(f"High: {entry_stats['High']} ({entry_stats['High']/total_entries*100:.1f}%)")
+        print(f"Low:  {entry_stats['Low']} ({entry_stats['Low']/total_entries*100:.1f}%)")
+        
+        if reward_stats['High']:
+            print(f"Average Reward High: {np.mean(reward_stats['High']):.3f}")
+        if reward_stats['Low']:
+            print(f"Average Reward Low:  {np.mean(reward_stats['Low']):.3f}")
+        if reward_stats['Hold']:
+            print(f"Average Reward Hold: {np.mean(reward_stats['Hold']):.3f}")
+        print("="*60)
     
     # キャッシュクリア
     global _feature_cache
