@@ -19,6 +19,8 @@ import csv
 import time
 import random
 import pickle
+import threading
+import traceback
 import numpy as np
 import pandas as pd
 from datetime import datetime, timedelta
@@ -140,6 +142,13 @@ if not os.path.exists(LOG_PATH):
 
 # DQNの閾値（Holdをスキップする／しきい値）
 DQN_Q_MARGIN = 0.0  # Holdとの差でエントリーを抑制したければ正にする
+
+# トレンドフィルター設定
+TREND_FILTER_ENABLED = True  # トレンドフィルターを有効にする
+TREND_LOOKBACK_PERIODS = 8  # 直近の価格傾き判定期間（短期集中）
+PRICE_SLOPE_THRESHOLD = -0.0001  # 価格傾きの閾値（負の値で下降判定）
+CONSECUTIVE_LOSS_THRESHOLD = 3  # 連続負け回数の閾値
+LOSS_LOOKBACK_MINUTES = 5  # 直近何分間の負け履歴を確認するか
 
 # -----------------------
 # FeatureExtraction（既存ロジック準拠）
@@ -350,6 +359,137 @@ def FeatureExtraction(df):
     print(f"[DEBUG] FeatureExtraction output shape: {result.shape}")
     
     return result
+
+def analyze_price_slope_and_losses(prices, price_times, loss_history):
+    """
+    価格の傾きと直近の負け履歴を分析する（負けエントリー地点基準版）
+    Args:
+        prices: 価格のリスト（最新の価格が最後）
+        price_times: 価格の時刻リスト
+        loss_history: 負け履歴のリスト [(datetime, action_str, result, entry_price), ...]
+    Returns:
+        dict: 分析結果
+    """
+    if len(prices) < 2:
+        return {
+            'price_slope': 0.0,
+            'is_declining': False,
+            'recent_losses': 0,
+            'should_block_high': False,
+            'should_block_low': False,
+            'loss_entry_point': None
+        }
+    
+    # 直近の負け履歴を確認
+    current_time = datetime.now()
+    cutoff_time = current_time - timedelta(minutes=LOSS_LOOKBACK_MINUTES)
+    
+    recent_losses = 0
+    recent_high_losses = 0
+    recent_low_losses = 0
+    first_loss_time = None
+    first_loss_price = None
+    
+    # 時系列順にソートして最初の負けを見つける
+    sorted_losses = sorted([loss for loss in loss_history if loss[0] > cutoff_time and loss[2] == 'loss'], 
+                          key=lambda x: x[0])
+    
+    for loss_time, action, result, entry_price in sorted_losses:
+        recent_losses += 1
+        if action == 'High':
+            recent_high_losses += 1
+        elif action == 'Low':
+            recent_low_losses += 1
+        
+        # 最初の負けの情報を記録
+        if first_loss_time is None:
+            first_loss_time = loss_time
+            first_loss_price = entry_price
+    
+    # 傾きを計算
+    price_slope = 0.0
+    normalized_slope = 0.0
+    
+    if first_loss_time is not None and first_loss_price is not None:
+        # 最初の負けのエントリー地点から現在価格までの傾きを計算
+        current_price = prices[-1]
+        time_diff = (current_time - first_loss_time).total_seconds() / 60.0  # 分単位
+        
+        if time_diff > 0:
+            price_diff = current_price - first_loss_price
+            price_slope = price_diff / time_diff  # 1分あたりの価格変化
+            normalized_slope = price_slope / first_loss_price  # 価格で正規化
+            
+            print(f"[SLOPE DEBUG] 最初の負け: {first_loss_time.strftime('%H:%M:%S')} @ {first_loss_price:.3f}")
+            print(f"[SLOPE DEBUG] 現在価格: {current_price:.3f}, 時間差: {time_diff:.1f}分")
+            print(f"[SLOPE DEBUG] 傾き: {normalized_slope:.8f}")
+    else:
+        # 負け履歴がない場合は従来通り直近の価格で計算
+        if len(prices) >= TREND_LOOKBACK_PERIODS:
+            recent_prices = prices[-TREND_LOOKBACK_PERIODS:]
+            x = np.arange(len(recent_prices))
+            y = np.array(recent_prices)
+            
+            try:
+                slope, intercept = np.polyfit(x, y, 1)
+                normalized_slope = slope / np.mean(recent_prices)
+            except:
+                normalized_slope = 0
+    
+    # 価格が下降傾向かどうか
+    is_declining = normalized_slope < PRICE_SLOPE_THRESHOLD
+    
+    # フィルター判定
+    should_block_high = (
+        is_declining and 
+        recent_high_losses >= CONSECUTIVE_LOSS_THRESHOLD
+    )
+    
+    should_block_low = (
+        not is_declining and  # 上昇傾向の時
+        normalized_slope > -PRICE_SLOPE_THRESHOLD and  # 明確な上昇
+        recent_low_losses >= CONSECUTIVE_LOSS_THRESHOLD
+    )
+    
+    return {
+        'price_slope': normalized_slope,
+        'is_declining': is_declining,
+        'recent_losses': recent_losses,
+        'recent_high_losses': recent_high_losses,
+        'recent_low_losses': recent_low_losses,
+        'should_block_high': should_block_high,
+        'should_block_low': should_block_low,
+        'loss_entry_point': (first_loss_time, first_loss_price) if first_loss_time else None,
+        'raw_slope': price_slope
+    }
+
+def apply_slope_and_loss_filter(action_str, q_values, slope_analysis):
+    """
+    価格傾きと負け履歴に基づくシンプルなフィルター
+    Args:
+        action_str: 元のアクション ('High', 'Low', 'Hold')
+        q_values: Q値の配列 [Hold, High, Low]
+        slope_analysis: analyze_price_slope_and_losses()の結果
+    Returns:
+        tuple: (filtered_action_str, reason)
+    """
+    if not TREND_FILTER_ENABLED:
+        return action_str, ""
+    
+    # 下降傾向 + 直近のHigh負けが多い場合、High判定をブロック
+    if action_str == "High" and slope_analysis['should_block_high']:
+        print(f"[SLOPE FILTER] 下降傾向 + High負け連発検出 - High判定をHoldに変更")
+        print(f"[SLOPE FILTER] 傾き: {slope_analysis['price_slope']:.6f}, 直近High負け: {slope_analysis['recent_high_losses']}回")
+        return "Hold", f"slope_down_high_losses(slope:{slope_analysis['price_slope']:.6f},losses:{slope_analysis['recent_high_losses']})"
+    
+    # 上昇傾向 + 直近のLow負けが多い場合、Low判定をブロック  
+    elif action_str == "Low" and slope_analysis['should_block_low']:
+        print(f"[SLOPE FILTER] 上昇傾向 + Low負け連発検出 - Low判定をHoldに変更")
+        print(f"[SLOPE FILTER] 傾き: {slope_analysis['price_slope']:.6f}, 直近Low負け: {slope_analysis['recent_low_losses']}回")
+        return "Hold", f"slope_up_low_losses(slope:{slope_analysis['price_slope']:.6f},losses:{slope_analysis['recent_low_losses']})"
+    
+    # その他の場合はそのまま
+    return action_str, ""
 
 # -----------------------
 # human-like 操作関数 (Playwright用)
@@ -831,11 +971,70 @@ else:
 # -----------------------
 # ログ関数 (q値とactionを記録)
 # -----------------------
-def _log_signal(ts, price, phase, q_values, action_idx, action_str, entry, reason):
+def check_trade_result(entry_time, action_str, entry_price, loss_history_ref):
+    """
+    取引結果を確認して負け履歴に追加（負けエントリー基準版）
+    実際の実装では取引プラットフォームのAPIを使用
+    Args:
+        entry_time: エントリー時刻
+        action_str: アクション（'High' or 'Low'）
+        entry_price: エントリー価格
+        loss_history_ref: 負け履歴リストの参照
+    """
+    try:
+        print(f"[RESULT CHECK] {entry_time.strftime('%H:%M:%S')}の{action_str}取引結果確認")
+        
+        # 実際の実装では、ここで取引プラットフォームのAPIから結果を取得
+        # 現在は簡易版として、手動で負け履歴に追加する例を示す
+        
+        # 例：負けた場合の履歴追加（実際のAPIから取得した結果に基づく）
+        # result = get_trade_result_from_api(entry_time, action_str)
+        # if result == 'loss':
+        #     loss_history_ref.append((entry_time, action_str, 'loss', entry_price))
+        #     print(f"[RESULT] 負け記録追加: {action_str} @ {entry_price:.3f}")
+        
+        print(f"[INFO] 取引結果確認完了（手動で結果を確認してください）")
+        
+    except Exception as e:
+        print(f"[ERROR] 取引結果確認エラー: {e}")
+
+def add_loss_to_history(loss_history, action_str, entry_price, entry_time=None):
+    """
+    手動で負け履歴に追加するヘルパー関数
+    Args:
+        loss_history: 負け履歴リスト
+        action_str: 負けたアクション（'High' or 'Low'）
+        entry_price: エントリー価格
+        entry_time: エントリー時刻（Noneの場合は現在時刻）
+    """
+    if entry_time is None:
+        entry_time = datetime.now()
+    
+    loss_history.append((entry_time, action_str, 'loss', entry_price))
+    print(f"[MANUAL LOSS] 負け履歴追加: {action_str} @ {entry_price:.3f} at {entry_time.strftime('%H:%M:%S')}")
+    
+    # 古い履歴をクリーンアップ
+    cutoff_time = datetime.now() - timedelta(minutes=LOSS_LOOKBACK_MINUTES * 2)
+    loss_history[:] = [loss for loss in loss_history if loss[0] > cutoff_time]
+
+def _log_signal(ts, price, phase, q_values, action_idx, action_str, entry, reason, slope_info=None):
     try:
         q_hold = q_values[0] if q_values is not None else ""
         q_high = q_values[1] if q_values is not None else ""
         q_low  = q_values[2] if q_values is not None else ""
+        
+        # 傾き・負け履歴情報を理由に追加
+        if slope_info:
+            slope_suffix = f"|slope:{slope_info['price_slope']:.6f}"
+            slope_suffix += f"|decline:{slope_info['is_declining']}"
+            slope_suffix += f"|high_losses:{slope_info['recent_high_losses']}"
+            slope_suffix += f"|low_losses:{slope_info['recent_low_losses']}"
+            if slope_info['should_block_high']:
+                slope_suffix += "|BLOCK_HIGH"
+            elif slope_info['should_block_low']:
+                slope_suffix += "|BLOCK_LOW"
+            reason = (reason or "") + slope_suffix
+        
         with open(LOG_PATH, "a", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
             w.writerow([
@@ -915,6 +1114,7 @@ with sync_playwright() as p:
 
     # ループ準備
     all_ticks = []
+    loss_history = []  # 負け履歴: [(datetime, action_str, result, entry_price), ...]
     last_entry_time = None
     next_entry_allowed_time = None
     recent_prices = deque(maxlen= int(10 / max(TICK_INTERVAL_SECONDS, 0.001)) + 2)
@@ -1051,11 +1251,48 @@ with sync_playwright() as p:
                 time.sleep(TICK_INTERVAL_SECONDS)
                 continue
 
+            # 価格傾きと負け履歴分析を実行
+            price_history = [t[1] for t in all_ticks[-TREND_LOOKBACK_PERIODS:]] if len(all_ticks) >= TREND_LOOKBACK_PERIODS else [t[1] for t in all_ticks]
+            time_history = [t[0] for t in all_ticks[-TREND_LOOKBACK_PERIODS:]] if len(all_ticks) >= TREND_LOOKBACK_PERIODS else [t[0] for t in all_ticks]
+            slope_analysis = analyze_price_slope_and_losses(price_history, time_history, loss_history)
+            
+            # 傾きと負け履歴フィルターを適用
+            original_action = action_str
+            action_str, filter_reason = apply_slope_and_loss_filter(action_str, q_values, slope_analysis)
+            
+            # アクションが変更された場合、action_idxも更新
+            if action_str != original_action:
+                action_map_reverse = {"Hold": 0, "High": 1, "Low": 2}
+                action_idx = action_map_reverse.get(action_str, 0)
+            
+            # 傾き・負け履歴情報をログ出力
+            if TREND_FILTER_ENABLED:
+                direction = "下降" if slope_analysis['is_declining'] else "上昇/横ばい"
+                print(f"[SLOPE] 傾き方向:{direction}, 傾き値:{slope_analysis['price_slope']:.8f}")
+                
+                if slope_analysis['loss_entry_point']:
+                    loss_time, loss_price = slope_analysis['loss_entry_point']
+                    print(f"[SLOPE] 基準点: {loss_time.strftime('%H:%M:%S')} @ {loss_price:.3f} (最初の負けエントリー)")
+                else:
+                    print(f"[SLOPE] 基準点: 直近{TREND_LOOKBACK_PERIODS}期間の線形回帰")
+                
+                print(f"[LOSS] 直近負け - High:{slope_analysis['recent_high_losses']}回, Low:{slope_analysis['recent_low_losses']}回")
+                
+                if slope_analysis['should_block_high']:
+                    print(f"[WARNING] 🚫 High判定ブロック条件検出")
+                elif slope_analysis['should_block_low']:
+                    print(f"[WARNING] � Low判定ブロック条件検出")
+                
+                if original_action != action_str:
+                    print(f"[FILTER] 🛡️ アクション変更: {original_action} -> {action_str}")
+
             # Decide entry: skip Hold
             if action_str == "Hold":
-                reason = "hold"
+                reason = filter_reason or "hold"
                 entry = False
                 print(f"[{current_time.strftime('%H:%M:%S')}] Hold - Q値: Hold={q_values[0]:.3f}, High={q_values[1]:.3f}, Low={q_values[2]:.3f}")
+                if filter_reason:
+                    print(f"[{current_time.strftime('%H:%M:%S')}] トレンドフィルターによりHold: {filter_reason}")
             else:
                 # optionally require q advantage over hold
                 q_advantage = q_values[action_idx] - q_values[0]
@@ -1074,8 +1311,10 @@ with sync_playwright() as p:
                             last_entry_time = current_time
                             next_entry_allowed_time = current_time + timedelta(seconds=ENTRY_COOLDOWN_SECONDS)
                             entry = True
-                            reason = "entry_executed"
+                            reason = filter_reason or "entry_executed"
                             print(f"[ENTRY] {action_str} at {current_time.strftime('%H:%M:%S')} price={current_price} Q値: {q_values[action_idx]:.3f} (優位性: {q_advantage:.3f})")
+                            if original_action != action_str:
+                                print(f"[ENTRY] 元の予測:{original_action} -> トレンドフィルター適用後:{action_str}")
                         else:
                             reason = "button_not_found"
                             entry = False
@@ -1086,7 +1325,8 @@ with sync_playwright() as p:
                     print(f"[{current_time.strftime('%H:%M:%S')}] {action_str} - Q値優位性不足 ({q_advantage:.3f} < {DQN_Q_MARGIN})")
 
             # log
-            _log_signal(current_time, current_price, phase, q_values, action_idx, action_str, entry, reason)
+            slope_info = slope_analysis if 'slope_analysis' in locals() else None
+            _log_signal(current_time, current_price, phase, q_values, action_idx, action_str, entry, reason, slope_info)
 
             # prune ticks older than e.g. 2 hours to keep memory bounded
             two_hours_ago = current_time - timedelta(hours=2)
