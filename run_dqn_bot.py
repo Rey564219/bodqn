@@ -149,6 +149,7 @@ TREND_LOOKBACK_PERIODS = 8  # 直近の価格傾き判定期間（短期集中�
 PRICE_SLOPE_THRESHOLD = -0.0001  # 価格傾きの閾値（負の値で下降判定）
 CONSECUTIVE_LOSS_THRESHOLD = 3  # 連続負け回数の閾値
 LOSS_LOOKBACK_MINUTES = 5  # 直近何分間の負け履歴を確認するか
+ENTRY_BLOCK_DURATION_SECONDS = 180  # 連敗時のエントリー停止時間（3分=180秒）
 
 # -----------------------
 # FeatureExtraction（既存ロジック準拠）
@@ -436,36 +437,57 @@ def analyze_price_slope_and_losses(prices, price_times, loss_history):
             except:
                 normalized_slope = 0
     
-    # 価格が下降傾向かどうか
+    # 価格が下降傾向かどうか（閾値を緩和）
     is_declining = normalized_slope < PRICE_SLOPE_THRESHOLD
+    is_rising = normalized_slope > -PRICE_SLOPE_THRESHOLD
     
-    # フィルター判定
+    # フィルター判定（連敗検出時にブロック）
     should_block_high = (
-        is_declining and 
         recent_high_losses >= CONSECUTIVE_LOSS_THRESHOLD
     )
     
     should_block_low = (
-        not is_declining and  # 上昇傾向の時
-        normalized_slope > -PRICE_SLOPE_THRESHOLD and  # 明確な上昇
         recent_low_losses >= CONSECUTIVE_LOSS_THRESHOLD
     )
+    
+    # ブロック解除判定（3分経過後に状況が変化したか）
+    block_high_until = None
+    block_low_until = None
+    
+    if should_block_high and first_loss_time:
+        block_high_until = first_loss_time + timedelta(seconds=ENTRY_BLOCK_DURATION_SECONDS)
+        # 3分経過後、トレンドが上昇に変わっていればブロック解除
+        if current_time > block_high_until:
+            if is_rising:  # 上昇トレンドに転換
+                should_block_high = False
+                print(f"[BLOCK RELEASE] High判定ブロック解除（上昇トレンド検出）")
+    
+    if should_block_low and first_loss_time:
+        block_low_until = first_loss_time + timedelta(seconds=ENTRY_BLOCK_DURATION_SECONDS)
+        # 3分経過後、トレンドが下降に変わっていればブロック解除
+        if current_time > block_low_until:
+            if is_declining:  # 下降トレンドに転換
+                should_block_low = False
+                print(f"[BLOCK RELEASE] Low判定ブロック解除（下降トレンド検出）")
     
     return {
         'price_slope': normalized_slope,
         'is_declining': is_declining,
+        'is_rising': is_rising,
         'recent_losses': recent_losses,
         'recent_high_losses': recent_high_losses,
         'recent_low_losses': recent_low_losses,
         'should_block_high': should_block_high,
         'should_block_low': should_block_low,
         'loss_entry_point': (first_loss_time, first_loss_price) if first_loss_time else None,
-        'raw_slope': price_slope
+        'raw_slope': price_slope,
+        'block_high_until': block_high_until,
+        'block_low_until': block_low_until
     }
 
 def apply_slope_and_loss_filter(action_str, q_values, slope_analysis):
     """
-    価格傾きと負け履歴に基づくシンプルなフィルター
+    価格傾きと負け履歴に基づくシンプルなフィルター（連敗時3分間ブロック機能付き）
     Args:
         action_str: 元のアクション ('High', 'Low', 'Hold')
         q_values: Q値の配列 [Hold, High, Low]
@@ -476,17 +498,45 @@ def apply_slope_and_loss_filter(action_str, q_values, slope_analysis):
     if not TREND_FILTER_ENABLED:
         return action_str, ""
     
-    # 下降傾向 + 直近のHigh負けが多い場合、High判定をブロック
-    if action_str == "High" and slope_analysis['should_block_high']:
-        print(f"[SLOPE FILTER] 下降傾向 + High負け連発検出 - High判定をHoldに変更")
-        print(f"[SLOPE FILTER] 傾き: {slope_analysis['price_slope']:.6f}, 直近High負け: {slope_analysis['recent_high_losses']}回")
-        return "Hold", f"slope_down_high_losses(slope:{slope_analysis['price_slope']:.6f},losses:{slope_analysis['recent_high_losses']})"
+    current_time = datetime.now()
     
-    # 上昇傾向 + 直近のLow負けが多い場合、Low判定をブロック  
+    # High負けが連発している場合、High判定を3分間ブロック
+    if action_str == "High" and slope_analysis['should_block_high']:
+        block_until = slope_analysis.get('block_high_until')
+        if block_until and current_time < block_until:
+            remaining_time = int((block_until - current_time).total_seconds())
+            print(f"[🚫 BLOCK] High負け{slope_analysis['recent_high_losses']}連続 - High判定を{remaining_time}秒間ブロック中")
+            print(f"[SLOPE FILTER] 傾き: {slope_analysis['price_slope']:.6f}")
+            return "Hold", f"high_loss_block_{remaining_time}s(losses:{slope_analysis['recent_high_losses']})"
+        else:
+            print(f"[SLOPE FILTER] High負け連発検出だが、ブロック期間終了 - 状況確認中")
+            print(f"[SLOPE FILTER] 傾き: {slope_analysis['price_slope']:.6f}, 直近High負け: {slope_analysis['recent_high_losses']}回")
+            # ブロック期間終了後は傾向が変わったかチェック済み
+            if slope_analysis.get('is_rising', False):
+                print(f"[✓ UNBLOCK] トレンド転換（上昇）を検出 - High判定を許可")
+                return action_str, ""
+            else:
+                print(f"[BLOCK CONTINUE] まだ下降傾向 - High判定をブロック継続")
+                return "Hold", f"high_loss_trend_continue(slope:{slope_analysis['price_slope']:.6f})"
+    
+    # Low負けが連発している場合、Low判定を3分間ブロック
     elif action_str == "Low" and slope_analysis['should_block_low']:
-        print(f"[SLOPE FILTER] 上昇傾向 + Low負け連発検出 - Low判定をHoldに変更")
-        print(f"[SLOPE FILTER] 傾き: {slope_analysis['price_slope']:.6f}, 直近Low負け: {slope_analysis['recent_low_losses']}回")
-        return "Hold", f"slope_up_low_losses(slope:{slope_analysis['price_slope']:.6f},losses:{slope_analysis['recent_low_losses']})"
+        block_until = slope_analysis.get('block_low_until')
+        if block_until and current_time < block_until:
+            remaining_time = int((block_until - current_time).total_seconds())
+            print(f"[🚫 BLOCK] Low負け{slope_analysis['recent_low_losses']}連続 - Low判定を{remaining_time}秒間ブロック中")
+            print(f"[SLOPE FILTER] 傾き: {slope_analysis['price_slope']:.6f}")
+            return "Hold", f"low_loss_block_{remaining_time}s(losses:{slope_analysis['recent_low_losses']})"
+        else:
+            print(f"[SLOPE FILTER] Low負け連発検出だが、ブロック期間終了 - 状況確認中")
+            print(f"[SLOPE FILTER] 傾き: {slope_analysis['price_slope']:.6f}, 直近Low負け: {slope_analysis['recent_low_losses']}回")
+            # ブロック期間終了後は傾向が変わったかチェック済み
+            if slope_analysis.get('is_declining', False):
+                print(f"[✓ UNBLOCK] トレンド転換（下降）を検出 - Low判定を許可")
+                return action_str, ""
+            else:
+                print(f"[BLOCK CONTINUE] まだ上昇傾向 - Low判定をブロック継続")
+                return "Hold", f"low_loss_trend_continue(slope:{slope_analysis['price_slope']:.6f})"
     
     # その他の場合はそのまま
     return action_str, ""
@@ -528,30 +578,42 @@ def human_type(element, text):
             print(f"[ERROR] fallback fill 失敗: {e2}")
 
 def try_close_popups(page):
-    """ポップアップ・広告・モーダルを確実に閉じる"""
+    """ポップアップ・広告・モーダルを確実に閉じる（ログインダイアログは除外）"""
     try:
         print("[INFO] ポップアップ・広告の閉じ処理を開始...")
         
-        # 1. チャットウィジェットを無効化
+        # ログインダイアログが表示されている場合は処理をスキップ
+        try:
+            login_btn = page.query_selector('#btnSubmit')
+            if login_btn and login_btn.is_visible():
+                print("[INFO] ログインダイアログ表示中のため、ポップアップ閉じ処理をスキップ")
+                return
+        except Exception:
+            pass
+        
+        # 1. チャットウィジェットを完全に削除
         try:
             page.evaluate("""
-                // Intercomチャットを非表示
-                const chatIframes = document.querySelectorAll('iframe[title*="Intercom"], iframe.intercom-with-namespace-vo6dyv');
+                // Intercomチャットを完全に削除（非表示ではなく削除）
+                const chatIframes = document.querySelectorAll('iframe[title*="Intercom"], iframe.intercom-with-namespace-vo6dyv, iframe[name*="intercom"]');
                 chatIframes.forEach(iframe => {
-                    iframe.style.display = 'none';
-                    iframe.style.visibility = 'hidden';
+                    iframe.remove();  // DOMから削除
                 });
                 
-                // チャットコンテナも非表示
-                const chatContainers = document.querySelectorAll('#intercom-container, .intercom-namespace');
+                // チャットコンテナも削除
+                const chatContainers = document.querySelectorAll('#intercom-container, .intercom-namespace, .intercom-with-namespace-vo6dyv');
                 chatContainers.forEach(container => {
-                    container.style.display = 'none';
-                    container.style.visibility = 'hidden';
+                    container.remove();  // DOMから削除
                 });
+                
+                // Intercomスクリプトも無効化
+                if (window.Intercom) {
+                    try { window.Intercom('shutdown'); } catch(e) {}
+                }
             """)
-            print("[INFO] チャットウィジェット無効化完了")
+            print("[INFO] チャットウィジェット削除完了")
         except Exception as e:
-            print(f"[WARN] チャット無効化失敗: {e}")
+            print(f"[WARN] チャット削除失敗: {e}")
         
         # 2. 共通的な閉じるボタンを探して実行
         close_selectors = [
@@ -624,12 +686,26 @@ def try_close_popups(page):
         except Exception:
             pass
         
-        # 5. JavaScript実行で強制的にポップアップを削除
+        # 5. JavaScript実行で強制的にポップアップを削除（ログインフォームは除外）
         try:
             page.evaluate("""
+                // ログインボタンが存在するかチェック
+                const loginBtn = document.querySelector('#btnSubmit');
+                if (loginBtn && loginBtn.offsetParent !== null) {
+                    // ログインダイアログ表示中なので削除処理をスキップ
+                    console.log('[INFO] ログインダイアログ表示中のため、削除処理スキップ');
+                    return;
+                }
+                
                 // 固定位置の要素（ポップアップの可能性）を削除
                 const fixedElements = document.querySelectorAll('*');
                 fixedElements.forEach(el => {
+                    // ログインフォーム関連の要素は除外
+                    if (el.id === 'loginForm' || el.closest('#loginForm') || 
+                        el.querySelector('#btnSubmit') || el.closest('[class*="login"]')) {
+                        return;
+                    }
+                    
                     const style = window.getComputedStyle(el);
                     if (style.position === 'fixed' && 
                         (style.zIndex > 1000 || el.classList.contains('modal') || 
@@ -638,15 +714,20 @@ def try_close_popups(page):
                     }
                 });
                 
-                // 既知の広告・ポップアップクラスを削除
+                // 既知の広告・ポップアップクラスを削除（ログイン関連は除外）
                 const adSelectors = [
-                    '.advertisement', '.ad-banner', '.popup', '.modal', 
-                    '.overlay', '.lightbox', '.dialog', '.notification'
+                    '.advertisement', '.ad-banner', '.popup:not([class*="login"])', 
+                    '.modal:not([class*="login"])', '.overlay:not([class*="login"])', 
+                    '.lightbox', '.dialog:not([class*="login"])', '.notification'
                 ];
                 adSelectors.forEach(selector => {
-                    document.querySelectorAll(selector).forEach(el => {
-                        if (el.style.zIndex > 100) el.style.display = 'none';
-                    });
+                    try {
+                        document.querySelectorAll(selector).forEach(el => {
+                            if (!el.querySelector('#btnSubmit') && !el.closest('[class*="login"]')) {
+                                if (el.style.zIndex > 100) el.style.display = 'none';
+                            }
+                        });
+                    } catch(e) {}
                 });
             """)
             print("[INFO] JavaScript強制削除完了")
@@ -666,10 +747,17 @@ def ensure_session(page, email, passward):
         # login form present -> attempt re-login
         print("[INFO] ログインフォーム検出 -> 再ログイン実施")
         try:
+            # Intercomチャットを削除
+            page.evaluate("""
+                const intercomContainer = document.querySelector('#intercom-container');
+                if (intercomContainer) intercomContainer.remove();
+                document.querySelectorAll('iframe[title*="Intercom"]').forEach(iframe => iframe.remove());
+            """)
+            
             # メールアドレス入力
             email_input = page.query_selector('input[type="email"]') or page.query_selector('input[name="email"]') or page.query_selector('.form-control.lg-input')
             if email_input:
-                email_input.clear()
+                email_input.fill("")  # clear()の代わりにfill("")を使用
                 email_input.type(email, delay=50)
             
             # パスワード入力  
@@ -680,11 +768,12 @@ def ensure_session(page, email, passward):
                     password_input = inputs[1]
             
             if password_input:
-                password_input.clear()
+                password_input.fill("")  # clear()の代わりにfill("")を使用
                 password_input.type(passward, delay=50)
             
-            # ログインボタンクリック
-            login_btn.click()
+            # ログインボタンクリック（force=Trueで強制クリック）
+            login_btn.click(force=True)
+            print("[INFO] ログインボタンクリック完了、ページ遷移を待機...")
             
         except Exception as e:
             print(f"[WARN] Standard login failed, using fallback: {e}")
@@ -694,11 +783,29 @@ def ensure_session(page, email, passward):
                 inputs[0].fill(email)
                 inputs[1].fill(passward)
             login_btn.click()
+        
+        # ログイン後の待機時間を長めに
+        time.sleep(3)
+        
+        # ログインダイアログが消えるのを待つ
         try:
-            page.wait_for_selector('.strikeWrapper div', timeout=3000)
+            print("[INFO] ログインダイアログの消失を待機...")
+            page.wait_for_selector('#btnSubmit', state='hidden', timeout=10000)
+            print("[INFO] ログインダイアログが閉じました")
+        except Exception as e:
+            print(f"[WARN] ログインダイアログ消失待機タイムアウト: {e}")
+        
+        # strikeWrapper待機
+        try:
+            page.wait_for_selector('.strikeWrapper div', timeout=5000)
+            print("[INFO] strikeWrapper検出完了")
         except Exception:
             print("[WARN] strikeWrapper待機タイムアウト (セッション復帰遅延)")
+        
+        # ポップアップ閉じる（ログイン後の広告など）
+        time.sleep(1)
         try_close_popups(page)
+        
         return True
     except Exception as e:
         print(f"[WARN] 再ログイン試行でエラー: {e}")
@@ -971,29 +1078,74 @@ else:
 # -----------------------
 # ログ関数 (q値とactionを記録)
 # -----------------------
-def check_trade_result(entry_time, action_str, entry_price, loss_history_ref):
+def scrape_trade_results(page):
     """
-    取引結果を確認して負け履歴に追加（負けエントリー基準版）
-    実際の実装では取引プラットフォームのAPIを使用
+    Webページから取引結果をスクレイピング
+    Args:
+        page: Playwrightのページオブジェクト
+    Returns:
+        list: [(entry_time, action_str, result, entry_price), ...]
+    """
+    try:
+        results = []
+        
+        # 取引履歴の要素を探す（実際のサイト構造に合わせて調整が必要）
+        # 以下は一般的な例
+        trade_history_selectors = [
+            '.trade-history-item',
+            '.transaction-item',
+            '[class*="trade"][class*="row"]',
+            '[class*="history"][class*="item"]'
+        ]
+        
+        for selector in trade_history_selectors:
+            items = page.query_selector_all(selector)
+            if items and len(items) > 0:
+                print(f"[SCRAPE] 取引履歴を{len(items)}件検出: {selector}")
+                for item in items[:10]:  # 最新10件のみ
+                    try:
+                        # テキストを取得
+                        text = item.inner_text().strip()
+                        # ここで結果を解析（実際のサイト構造に合わせる）
+                        # 例: "High - Loss - 150.123 - 12:34:56"
+                        print(f"[SCRAPE DEBUG] 取引履歴アイテム: {text}")
+                    except Exception as e:
+                        continue
+                break
+        
+        return results
+    except Exception as e:
+        print(f"[SCRAPE ERROR] 取引結果スクレイピングエラー: {e}")
+        return []
+
+def check_trade_result(entry_time, action_str, entry_price, loss_history_ref, page):
+    """
+    取引結果をスクレイピングで確認して負け履歴に追加
     Args:
         entry_time: エントリー時刻
         action_str: アクション（'High' or 'Low'）
         entry_price: エントリー価格
         loss_history_ref: 負け履歴リストの参照
+        page: Playwrightのページオブジェクト
     """
     try:
         print(f"[RESULT CHECK] {entry_time.strftime('%H:%M:%S')}の{action_str}取引結果確認")
         
-        # 実際の実装では、ここで取引プラットフォームのAPIから結果を取得
-        # 現在は簡易版として、手動で負け履歴に追加する例を示す
+        # スクレイピングで取引結果を取得
+        results = scrape_trade_results(page)
         
-        # 例：負けた場合の履歴追加（実際のAPIから取得した結果に基づく）
-        # result = get_trade_result_from_api(entry_time, action_str)
-        # if result == 'loss':
-        #     loss_history_ref.append((entry_time, action_str, 'loss', entry_price))
-        #     print(f"[RESULT] 負け記録追加: {action_str} @ {entry_price:.3f}")
+        # 結果から該当する取引を探す（時刻とアクションで一致判定）
+        for result_time, result_action, result_status, result_price in results:
+            time_diff = abs((result_time - entry_time).total_seconds())
+            if time_diff < 10 and result_action == action_str:  # 10秒以内の一致
+                if result_status == 'loss':
+                    loss_history_ref.append((entry_time, action_str, 'loss', entry_price))
+                    print(f"[RESULT] 負け記録追加: {action_str} @ {entry_price:.3f}")
+                else:
+                    print(f"[RESULT] 勝ち: {action_str} @ {entry_price:.3f}")
+                return
         
-        print(f"[INFO] 取引結果確認完了（手動で結果を確認してください）")
+        print(f"[INFO] 該当する取引結果が見つかりませんでした（手動で確認してください）")
         
     except Exception as e:
         print(f"[ERROR] 取引結果確認エラー: {e}")
@@ -1063,18 +1215,42 @@ with sync_playwright() as p:
     )
     page = context.new_page()
     page.goto(url)
+    print("[INFO] サイトを開きました。ポップアップの表示を待機中...")
 
-    # 初期待機 & ポップアップ閉じ
+    # サイトを開いて10秒待機（ポップアップが出現するまで）
     time.sleep(10)
-    try_close_popups(page)
+    print("[INFO] 10秒経過。ポップアップを閉じます...")
+    
+    # ポップアップを閉じる（複数回試行）
+    for i in range(3):
+        try_close_popups(page)
+        time.sleep(1)
+        print(f"[INFO] ポップアップ閉じ試行 {i+1}/3 完了")
+    
+    print("[INFO] ポップアップ処理完了。ログインを開始します...")
 
-    # ログイン (simple and stable)
+    # ログイン前にIntercomチャットを完全に削除
+    try:
+        page.evaluate("""
+            // Intercomチャット関連を完全に削除
+            const intercomContainer = document.querySelector('#intercom-container');
+            if (intercomContainer) {
+                intercomContainer.remove();
+            }
+            const chatIframes = document.querySelectorAll('iframe[title*="Intercom"]');
+            chatIframes.forEach(iframe => iframe.remove());
+        """)
+        print("[INFO] Intercomチャットを削除しました")
+    except Exception as e:
+        print(f"[WARN] Intercom削除失敗: {e}")
+    
+    # ログイン前に少し待機
     time.sleep(2)
     try:
         # メールアドレス入力
         email_input = page.query_selector('input[type="email"]') or page.query_selector('input[name="email"]') or page.query_selector('.form-control.lg-input')
         if email_input:
-            email_input.clear()
+            email_input.fill("")  # clear()の代わりにfill("")を使用
             email_input.type(email, delay=100)
             print(f"[INFO] Email entered: {email}")
         
@@ -1086,14 +1262,14 @@ with sync_playwright() as p:
                 password_input = inputs[1]
         
         if password_input:
-            password_input.clear()
+            password_input.fill("")  # clear()の代わりにfill("")を使用
             password_input.type(passward, delay=100)
             print(f"[INFO] Password entered")
         
-        # ログインボタンクリック
+        # ログインボタンクリック（force=Trueで強制クリック）
         login_btn = page.query_selector('#btnSubmit') or page.query_selector('button[type="submit"]') or page.query_selector('.btn-primary')
         if login_btn:
-            login_btn.click()
+            login_btn.click(force=True)
             print(f"[INFO] Login button clicked")
         
     except Exception as e:
@@ -1106,18 +1282,49 @@ with sync_playwright() as p:
             login_btn = page.query_selector('#btnSubmit')
             if login_btn:
                 login_btn.click()
+    
+    # ログイン後の待機
+    print("[INFO] ログイン処理完了。ページ遷移を待機中...")
+    time.sleep(3)
+    
+    # ログインダイアログが消えるのを待つ
+    try:
+        page.wait_for_selector('#btnSubmit', state='hidden', timeout=10000)
+        print("[INFO] ログインダイアログが閉じました")
+    except Exception as e:
+        print(f"[WARN] ログインダイアログ消失待機タイムアウト: {e}")
+    
+    # strikeWrapper待機
     try:
         page.wait_for_selector(".strikeWrapper div", timeout=20000)
+        print("[INFO] 取引画面の読み込み完了")
     except Exception:
-        pass
+        print("[WARN] strikeWrapper待機タイムアウト")
+    
+    # ログイン後のポップアップを閉じる
+    time.sleep(1)
     try_close_popups(page)
+    print("[INFO] 初期化完了。取引ループを開始します...")
 
     # ループ準備
     all_ticks = []
     loss_history = []  # 負け履歴: [(datetime, action_str, result, entry_price), ...]
+    pending_trades = []  # エントリー待ちの取引: [(entry_time, action_str, entry_price), ...]
     last_entry_time = None
     next_entry_allowed_time = None
     recent_prices = deque(maxlen= int(10 / max(TICK_INTERVAL_SECONDS, 0.001)) + 2)
+    
+    print("\n" + "="*60)
+    print("📊 負け履歴管理機能の使い方")
+    print("="*60)
+    print("取引が負けた場合、以下のコマンドで手動登録できます：")
+    print("  例: High負け → Pythonコンソールで実行")
+    print("      add_loss_to_history(loss_history, 'High', 150.123)")
+    print("  例: Low負け → Pythonコンソールで実行")
+    print("      add_loss_to_history(loss_history, 'Low', 150.456)")
+    print("\n※自動スクレイピング機能も実装されていますが、")
+    print("  サイト構造に合わせた調整が必要な場合があります。")
+    print("="*60 + "\n")
 
     while True:
         try:
@@ -1238,6 +1445,10 @@ with sync_playwright() as p:
                     action_map = {0:"Hold", 1:"High", 2:"Low"}
                     action_str = action_map.get(action_idx, "Hold")
                     
+                    # Q値の詳細をログ出力（デバッグ用）
+                    print(f"[Q-VALUES] Hold:{q_values[0]:.4f}, High:{q_values[1]:.4f}, Low:{q_values[2]:.4f}")
+                    print(f"[ACTION] 選択されたアクション: {action_str} (idx:{action_idx})")
+                    
                 except Exception as e:
                     print(f"[WARN] モデル推論失敗: {e}")
                     reason = "predict_error"
@@ -1268,23 +1479,41 @@ with sync_playwright() as p:
             # 傾き・負け履歴情報をログ出力
             if TREND_FILTER_ENABLED:
                 direction = "下降" if slope_analysis['is_declining'] else "上昇/横ばい"
-                print(f"[SLOPE] 傾き方向:{direction}, 傾き値:{slope_analysis['price_slope']:.8f}")
+                print(f"\n[📈 SLOPE] 傾き方向:{direction}, 傾き値:{slope_analysis['price_slope']:.8f}")
                 
                 if slope_analysis['loss_entry_point']:
                     loss_time, loss_price = slope_analysis['loss_entry_point']
-                    print(f"[SLOPE] 基準点: {loss_time.strftime('%H:%M:%S')} @ {loss_price:.3f} (最初の負けエントリー)")
+                    print(f"[📍 SLOPE] 基準点: {loss_time.strftime('%H:%M:%S')} @ {loss_price:.3f} (最初の負けエントリー)")
                 else:
-                    print(f"[SLOPE] 基準点: 直近{TREND_LOOKBACK_PERIODS}期間の線形回帰")
+                    print(f"[📍 SLOPE] 基準点: 直近{TREND_LOOKBACK_PERIODS}期間の線形回帰")
                 
-                print(f"[LOSS] 直近負け - High:{slope_analysis['recent_high_losses']}回, Low:{slope_analysis['recent_low_losses']}回")
+                print(f"[📊 LOSS] 直近負け - High:{slope_analysis['recent_high_losses']}回, Low:{slope_analysis['recent_low_losses']}回")
                 
+                # ブロック状態の詳細表示
                 if slope_analysis['should_block_high']:
-                    print(f"[WARNING] 🚫 High判定ブロック条件検出")
-                elif slope_analysis['should_block_low']:
-                    print(f"[WARNING] � Low判定ブロック条件検出")
+                    block_until = slope_analysis.get('block_high_until')
+                    if block_until:
+                        remaining = int((block_until - current_time).total_seconds())
+                        if remaining > 0:
+                            print(f"[🚫 BLOCK] High判定ブロック中 - 残り{remaining}秒（{block_until.strftime('%H:%M:%S')}まで）")
+                        else:
+                            print(f"[⏰ BLOCK] Highブロック期間終了 - トレンド確認中")
+                    else:
+                        print(f"[🚫 WARNING] High判定ブロック条件検出")
+                
+                if slope_analysis['should_block_low']:
+                    block_until = slope_analysis.get('block_low_until')
+                    if block_until:
+                        remaining = int((block_until - current_time).total_seconds())
+                        if remaining > 0:
+                            print(f"[🚫 BLOCK] Low判定ブロック中 - 残り{remaining}秒（{block_until.strftime('%H:%M:%S')}まで）")
+                        else:
+                            print(f"[⏰ BLOCK] Lowブロック期間終了 - トレンド確認中")
+                    else:
+                        print(f"[🚫 WARNING] Low判定ブロック条件検出")
                 
                 if original_action != action_str:
-                    print(f"[FILTER] 🛡️ アクション変更: {original_action} -> {action_str}")
+                    print(f"[🛡️ FILTER] アクション変更: {original_action} -> {action_str}")
 
             # Decide entry: skip Hold
             if action_str == "Hold":
@@ -1315,6 +1544,10 @@ with sync_playwright() as p:
                             print(f"[ENTRY] {action_str} at {current_time.strftime('%H:%M:%S')} price={current_price} Q値: {q_values[action_idx]:.3f} (優位性: {q_advantage:.3f})")
                             if original_action != action_str:
                                 print(f"[ENTRY] 元の予測:{original_action} -> トレンドフィルター適用後:{action_str}")
+                            
+                            # 取引を待ちリストに追加（60秒後に結果確認）
+                            pending_trades.append((current_time, action_str, current_price))
+                            print(f"[INFO] 取引を待ちリストに追加（60秒後に結果確認）")
                         else:
                             reason = "button_not_found"
                             entry = False
@@ -1328,6 +1561,20 @@ with sync_playwright() as p:
             slope_info = slope_analysis if 'slope_analysis' in locals() else None
             _log_signal(current_time, current_price, phase, q_values, action_idx, action_str, entry, reason, slope_info)
 
+            # 待機中の取引結果を確認（60秒経過したもの）
+            completed_trades = []
+            for trade_time, trade_action, trade_price in pending_trades[:]:
+                time_elapsed = (current_time - trade_time).total_seconds()
+                if time_elapsed >= 60:  # 60秒経過（1分BO終了）
+                    print(f"\n[⏰ CHECK] {trade_action}取引の結果確認 (エントリー: {trade_time.strftime('%H:%M:%S')} @ {trade_price:.3f})")
+                    check_trade_result(trade_time, trade_action, trade_price, loss_history, page)
+                    completed_trades.append((trade_time, trade_action, trade_price))
+            
+            # 確認済みの取引を待ちリストから削除
+            for completed in completed_trades:
+                if completed in pending_trades:
+                    pending_trades.remove(completed)
+            
             # prune ticks older than e.g. 2 hours to keep memory bounded
             two_hours_ago = current_time - timedelta(hours=2)
             all_ticks = [t for t in all_ticks if t[0] > two_hours_ago]
