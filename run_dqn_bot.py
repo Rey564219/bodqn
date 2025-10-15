@@ -1080,7 +1080,7 @@ else:
 # -----------------------
 def scrape_trade_results(page):
     """
-    Webページから取引結果をスクレイピング
+    Webページから取引結果をスクレイピング（TheOption専用）
     Args:
         page: Playwrightのページオブジェクト
     Returns:
@@ -1089,33 +1089,98 @@ def scrape_trade_results(page):
     try:
         results = []
         
-        # 取引履歴の要素を探す（実際のサイト構造に合わせて調整が必要）
-        # 以下は一般的な例
+        # TheOptionの取引履歴要素を探す
         trade_history_selectors = [
+            # TheOption特有のセレクタ
+            '.trading-history-item',
+            '.history-item',
+            '.trade-item',
+            '[class*="history"]',
+            '[class*="trade-history"]',
+            '[class*="transaction"]',
+            # 一般的なセレクタ
             '.trade-history-item',
             '.transaction-item',
             '[class*="trade"][class*="row"]',
-            '[class*="history"][class*="item"]'
+            '[class*="history"][class*="item"]',
+            # テーブル形式の場合
+            'table tbody tr',
+            '.table-row',
+            # リスト形式の場合
+            'ul li[class*="trade"]',
+            'ul li[class*="history"]'
         ]
         
+        print(f"\n[🔍 SCRAPE] 取引履歴の検索を開始...")
+        
+        # ページ全体のHTMLを確認（デバッグ用）
+        try:
+            # 取引履歴パネルを開く試み
+            history_buttons = [
+                'button:has-text("履歴")',
+                'button:has-text("History")',
+                '[class*="history"][class*="button"]',
+                '[class*="history"][class*="tab"]'
+            ]
+            
+            for btn_selector in history_buttons:
+                btn = page.query_selector(btn_selector)
+                if btn:
+                    print(f"[SCRAPE] 履歴ボタンを発見: {btn_selector}")
+                    try:
+                        if btn.is_visible():
+                            btn.click()
+                            print(f"[SCRAPE] 履歴パネルを開きました")
+                            time.sleep(0.5)
+                            break
+                    except:
+                        pass
+        except Exception as e:
+            print(f"[SCRAPE] 履歴パネルを開けませんでした: {e}")
+        
+        # すべてのセレクタを試す
         for selector in trade_history_selectors:
             items = page.query_selector_all(selector)
             if items and len(items) > 0:
-                print(f"[SCRAPE] 取引履歴を{len(items)}件検出: {selector}")
-                for item in items[:10]:  # 最新10件のみ
+                print(f"[✓ SCRAPE] 取引履歴を{len(items)}件検出: {selector}")
+                for idx, item in enumerate(items[:10]):  # 最新10件のみ
                     try:
                         # テキストを取得
                         text = item.inner_text().strip()
-                        # ここで結果を解析（実際のサイト構造に合わせる）
-                        # 例: "High - Loss - 150.123 - 12:34:56"
-                        print(f"[SCRAPE DEBUG] 取引履歴アイテム: {text}")
+                        html = item.inner_html()[:200]  # 最初の200文字
+                        
+                        print(f"\n[📄 SCRAPE #{idx+1}] テキスト: {text}")
+                        print(f"[📄 SCRAPE #{idx+1}] HTML: {html}...")
+                        
+                        # クラス名を確認
+                        class_name = item.get_attribute('class') or ''
+                        print(f"[📄 SCRAPE #{idx+1}] クラス: {class_name}")
+                        
+                        # 子要素を確認
+                        children = item.query_selector_all('*')
+                        print(f"[📄 SCRAPE #{idx+1}] 子要素数: {len(children)}")
+                        
                     except Exception as e:
+                        print(f"[SCRAPE ERROR] アイテム{idx+1}の解析エラー: {e}")
                         continue
                 break
+        else:
+            print(f"[⚠ SCRAPE] 取引履歴が見つかりませんでした")
+            print(f"[SCRAPE] ページのすべてのクラス名を確認中...")
+            
+            # ページ内のすべての要素のクラス名をリストアップ
+            all_elements = page.query_selector_all('[class*="trade"], [class*="history"], [class*="transaction"]')
+            print(f"[SCRAPE] 'trade', 'history', 'transaction'を含む要素: {len(all_elements)}件")
+            for elem in all_elements[:20]:
+                class_name = elem.get_attribute('class') or ''
+                if class_name:
+                    print(f"[SCRAPE] クラス: {class_name}")
         
         return results
     except Exception as e:
-        print(f"[SCRAPE ERROR] 取引結果スクレイピングエラー: {e}")
+        print(f"[❌ SCRAPE ERROR] 取引結果スクレイピングエラー: {e}")
+        import traceback
+        print(traceback.format_exc())
         return []
 
 def check_trade_result(entry_time, action_str, entry_price, loss_history_ref, page):
@@ -1129,23 +1194,35 @@ def check_trade_result(entry_time, action_str, entry_price, loss_history_ref, pa
         page: Playwrightのページオブジェクト
     """
     try:
-        print(f"[RESULT CHECK] {entry_time.strftime('%H:%M:%S')}の{action_str}取引結果確認")
+        print(f"\n{'='*60}")
+        print(f"[⏰ RESULT CHECK] {entry_time.strftime('%H:%M:%S')}の{action_str}取引結果確認")
+        print(f"[💰 ENTRY] エントリー価格: {entry_price:.3f}")
+        print(f"{'='*60}")
         
         # スクレイピングで取引結果を取得
         results = scrape_trade_results(page)
         
         # 結果から該当する取引を探す（時刻とアクションで一致判定）
+        found = False
         for result_time, result_action, result_status, result_price in results:
             time_diff = abs((result_time - entry_time).total_seconds())
             if time_diff < 10 and result_action == action_str:  # 10秒以内の一致
+                found = True
                 if result_status == 'loss':
                     loss_history_ref.append((entry_time, action_str, 'loss', entry_price))
-                    print(f"[RESULT] 負け記録追加: {action_str} @ {entry_price:.3f}")
+                    print(f"[❌ RESULT] 負け記録追加: {action_str} @ {entry_price:.3f}")
                 else:
-                    print(f"[RESULT] 勝ち: {action_str} @ {entry_price:.3f}")
-                return
+                    print(f"[✅ RESULT] 勝ち: {action_str} @ {entry_price:.3f}")
+                break
         
-        print(f"[INFO] 該当する取引結果が見つかりませんでした（手動で確認してください）")
+        if not found:
+            print(f"\n[⚠️ WARNING] 自動検出できませんでした")
+            print(f"[📋 手動記録方法]")
+            print(f"  負けた場合:")
+            print(f"    add_loss_to_history(loss_history, '{action_str}', {entry_price:.3f})")
+            print(f"  勝った場合:")
+            print(f"    （何もしなくてOK）")
+            print(f"{'='*60}\n")
         
     except Exception as e:
         print(f"[ERROR] 取引結果確認エラー: {e}")
@@ -1163,11 +1240,42 @@ def add_loss_to_history(loss_history, action_str, entry_price, entry_time=None):
         entry_time = datetime.now()
     
     loss_history.append((entry_time, action_str, 'loss', entry_price))
-    print(f"[MANUAL LOSS] 負け履歴追加: {action_str} @ {entry_price:.3f} at {entry_time.strftime('%H:%M:%S')}")
+    print(f"\n{'='*60}")
+    print(f"[✍️ MANUAL LOSS] 負け履歴を手動追加しました")
+    print(f"[📅 時刻] {entry_time.strftime('%H:%M:%S')}")
+    print(f"[📊 方向] {action_str}")
+    print(f"[💰 価格] {entry_price:.3f}")
+    print(f"[📈 累計] 直近の負け - High:{sum(1 for _, a, _, _ in loss_history if a == 'High')}回, Low:{sum(1 for _, a, _, _ in loss_history if a == 'Low')}回")
+    print(f"{'='*60}\n")
     
     # 古い履歴をクリーンアップ
     cutoff_time = datetime.now() - timedelta(minutes=LOSS_LOOKBACK_MINUTES * 2)
+    old_count = len(loss_history)
     loss_history[:] = [loss for loss in loss_history if loss[0] > cutoff_time]
+    cleaned = old_count - len(loss_history)
+    if cleaned > 0:
+        print(f"[🗑️ CLEANUP] 古い履歴{cleaned}件を削除しました")
+
+def add_last_trade_loss(loss_history, pending_trades):
+    """
+    直近のエントリーを負けとして記録する簡易関数
+    Args:
+        loss_history: 負け履歴リスト
+        pending_trades: 待機中の取引リスト
+    """
+    if pending_trades:
+        # 最後のエントリーを取得
+        last_trade = pending_trades[-1]
+        entry_time, action_str, entry_price = last_trade
+        add_loss_to_history(loss_history, action_str, entry_price, entry_time)
+        # 待機リストから削除
+        pending_trades.remove(last_trade)
+        print(f"[INFO] 待機リストから削除しました")
+    else:
+        print(f"[⚠️ WARNING] 記録する取引がありません")
+        print(f"[INFO] 直接記録する場合:")
+        print(f"  add_loss_to_history(loss_history, 'High', 150.123)  # High負け")
+        print(f"  add_loss_to_history(loss_history, 'Low', 150.123)   # Low負け")
 
 def _log_signal(ts, price, phase, q_values, action_idx, action_str, entry, reason, slope_info=None):
     try:
@@ -1314,17 +1422,33 @@ with sync_playwright() as p:
     next_entry_allowed_time = None
     recent_prices = deque(maxlen= int(10 / max(TICK_INTERVAL_SECONDS, 0.001)) + 2)
     
-    print("\n" + "="*60)
-    print("📊 負け履歴管理機能の使い方")
-    print("="*60)
-    print("取引が負けた場合、以下のコマンドで手動登録できます：")
-    print("  例: High負け → Pythonコンソールで実行")
-    print("      add_loss_to_history(loss_history, 'High', 150.123)")
-    print("  例: Low負け → Pythonコンソールで実行")
-    print("      add_loss_to_history(loss_history, 'Low', 150.456)")
-    print("\n※自動スクレイピング機能も実装されていますが、")
-    print("  サイト構造に合わせた調整が必要な場合があります。")
-    print("="*60 + "\n")
+    print("\n" + "="*80)
+    print("🤖 DQN自動取引BOT - 連敗フィルター機能付き")
+    print("="*80)
+    print("\n📊 負け履歴管理機能の使い方")
+    print("-"*80)
+    print("\n【方法1】最も簡単 - 直近の取引が負けた場合:")
+    print("  >>> add_last_trade_loss(loss_history, pending_trades)")
+    print("")
+    print("【方法2】個別に記録する場合:")
+    print("  High負け:")
+    print("    >>> add_loss_to_history(loss_history, 'High', 150.123)")
+    print("  Low負け:")
+    print("    >>> add_loss_to_history(loss_history, 'Low', 150.456)")
+    print("")
+    print("【方法3】過去の取引を記録する場合:")
+    print("  >>> from datetime import datetime, timedelta")
+    print("  >>> past_time = datetime.now() - timedelta(minutes=2)")
+    print("  >>> add_loss_to_history(loss_history, 'High', 150.123, past_time)")
+    print("")
+    print("🔥 連敗フィルター設定:")
+    print(f"  - 連続負け閾値: {CONSECUTIVE_LOSS_THRESHOLD}回")
+    print(f"  - ブロック時間: {ENTRY_BLOCK_DURATION_SECONDS}秒（{ENTRY_BLOCK_DURATION_SECONDS//60}分）")
+    print(f"  - 履歴参照期間: {LOSS_LOOKBACK_MINUTES}分")
+    print("")
+    print("※取引結果は60秒後に自動確認を試みますが、")
+    print("  確実に記録したい場合は上記コマンドで手動登録してください。")
+    print("="*80 + "\n")
 
     while True:
         try:
@@ -1569,11 +1693,39 @@ with sync_playwright() as p:
                     print(f"\n[⏰ CHECK] {trade_action}取引の結果確認 (エントリー: {trade_time.strftime('%H:%M:%S')} @ {trade_price:.3f})")
                     check_trade_result(trade_time, trade_action, trade_price, loss_history, page)
                     completed_trades.append((trade_time, trade_action, trade_price))
+                elif time_elapsed >= 50:  # 50秒経過で事前通知
+                    remaining = 60 - int(time_elapsed)
+                    if remaining > 0 and remaining % 5 == 0:  # 5秒ごとに表示
+                        print(f"[⏳ PENDING] {trade_action}取引の結果確認まで{remaining}秒...")
             
             # 確認済みの取引を待ちリストから削除
             for completed in completed_trades:
                 if completed in pending_trades:
                     pending_trades.remove(completed)
+            
+            # 待機中の取引がある場合は表示（1分ごと）
+            if pending_trades and current_time.second % 60 < TICK_INTERVAL_SECONDS:
+                print(f"\n[📋 PENDING TRADES] 結果待ち: {len(pending_trades)}件")
+                for trade_time, trade_action, trade_price in pending_trades:
+                    elapsed = int((current_time - trade_time).total_seconds())
+                    print(f"  - {trade_action} @ {trade_price:.3f} ({trade_time.strftime('%H:%M:%S')}, {elapsed}秒経過)")
+            
+            # 負け履歴の状態を定期的に表示（30秒ごと）
+            if current_time.second % 30 < TICK_INTERVAL_SECONDS and loss_history:
+                cutoff = current_time - timedelta(minutes=LOSS_LOOKBACK_MINUTES)
+                recent_losses = [l for l in loss_history if l[0] > cutoff]
+                high_losses = sum(1 for _, a, _, _ in recent_losses if a == 'High')
+                low_losses = sum(1 for _, a, _, _ in recent_losses if a == 'Low')
+                
+                print(f"\n[📊 LOSS HISTORY] 直近{LOSS_LOOKBACK_MINUTES}分間の負け履歴")
+                print(f"  - High負け: {high_losses}回 {'🚫ブロック対象' if high_losses >= CONSECUTIVE_LOSS_THRESHOLD else ''}")
+                print(f"  - Low負け: {low_losses}回 {'🚫ブロック対象' if low_losses >= CONSECUTIVE_LOSS_THRESHOLD else ''}")
+                
+                if recent_losses:
+                    print(f"  - 最新の負け:")
+                    for loss_time, loss_action, _, loss_price in recent_losses[-3:]:
+                        mins_ago = int((current_time - loss_time).total_seconds() / 60)
+                        print(f"    {loss_action} @ {loss_price:.3f} ({mins_ago}分前)")
             
             # prune ticks older than e.g. 2 hours to keep memory bounded
             two_hours_ago = current_time - timedelta(hours=2)
