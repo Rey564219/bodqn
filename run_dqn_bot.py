@@ -150,6 +150,16 @@ PRICE_SLOPE_THRESHOLD = -0.0001  # 価格傾きの閾値（負の値で下降判
 CONSECUTIVE_LOSS_THRESHOLD = 3  # 連続負け回数の閾値
 LOSS_LOOKBACK_MINUTES = 5  # 直近何分間の負け履歴を確認するか
 ENTRY_BLOCK_DURATION_SECONDS = 180  # 連敗時のエントリー停止時間（3分=180秒）
+# Recent-arrow based blocking (右から矢印を見て直近N回中M回負けたらブロック)
+RECENT_CHECK_COUNT = 10           # 右から見て何回分の矢印を見るか
+RECENT_LOSS_THRESHOLD = 6         # そのうち何回以上負けならブロックするか
+RECENT_BLOCK_SECONDS = 120        # 条件該当時にトレードを停止する秒数（2分）
+CHART_DEBUG_MODE = True           # チャート解析のデバッグモード
+
+# recent outcomes (module-level so helper functions can access)
+recent_trade_outcomes = deque(maxlen=RECENT_CHECK_COUNT)
+# trading paused until (None or datetime)
+trading_paused_until = None
 
 # -----------------------
 # FeatureExtraction（既存ロジック準拠）
@@ -1078,105 +1088,461 @@ else:
 # -----------------------
 # ログ関数 (q値とactionを記録)
 # -----------------------
+def scrape_chart_arrows(page):
+    """
+    チャート上の矢印をスクレイピングして勝敗を判定
+    Args:
+        page: Playwrightのページオブジェクト
+    Returns:
+        list: 右から順番に並んだ勝敗結果 ['win', 'loss', 'win', ...]（最新が先頭）
+    """
+    try:
+        print(f"\n[🎯 CHART] チャート矢印の解析を開始...")
+        
+        # 緊急モード: 明らかに負けている状況では全ての矢印を負けとして扱う
+        EMERGENCY_MODE = True  # 現在の状況では緊急モードを有効化
+        if EMERGENCY_MODE:
+            print("[🚨 EMERGENCY] 緊急モード: 検出された全ての矢印を負けとして判定")
+        
+        results = []
+        
+        # JavaScript でページ全体を詳しく調査
+        try:
+            page_analysis = page.evaluate("""
+                () => {
+                    const analysis = {
+                        svgs: [],
+                        canvases: [],
+                        arrows: [],
+                        charts: [],
+                        allElements: []
+                    };
+                    
+                    // SVG要素を調査
+                    const svgs = document.querySelectorAll('svg');
+                    svgs.forEach((svg, idx) => {
+                        const rect = svg.getBoundingClientRect();
+                        analysis.svgs.push({
+                            index: idx,
+                            width: rect.width,
+                            height: rect.height,
+                            x: rect.x,
+                            y: rect.y,
+                            classes: svg.className.baseVal || svg.className || '',
+                            id: svg.id || '',
+                            children: svg.children.length,
+                            innerHTML: svg.innerHTML.substring(0, 200)
+                        });
+                    });
+                    
+                    // Canvas要素を調査
+                    const canvases = document.querySelectorAll('canvas');
+                    canvases.forEach((canvas, idx) => {
+                        const rect = canvas.getBoundingClientRect();
+                        analysis.canvases.push({
+                            index: idx,
+                            width: rect.width,
+                            height: rect.height,
+                            x: rect.x,
+                            y: rect.y,
+                            classes: canvas.className || '',
+                            id: canvas.id || ''
+                        });
+                    });
+                    
+                    // チャート関連要素を調査
+                    const chartSelectors = [
+                        '[class*="chart"]',
+                        '[class*="trading"]',
+                        '[class*="candle"]',
+                        '[id*="chart"]',
+                        '[id*="trading"]'
+                    ];
+                    
+                    chartSelectors.forEach(selector => {
+                        try {
+                            const elements = document.querySelectorAll(selector);
+                            elements.forEach((el, idx) => {
+                                const rect = el.getBoundingClientRect();
+                                if (rect.width > 100 && rect.height > 100) { // 大きな要素のみ
+                                    analysis.charts.push({
+                                        selector: selector,
+                                        index: idx,
+                                        tagName: el.tagName,
+                                        classes: el.className || '',
+                                        id: el.id || '',
+                                        width: rect.width,
+                                        height: rect.height,
+                                        children: el.children.length
+                                    });
+                                }
+                            });
+                        } catch(e) {}
+                    });
+                    
+                    // 矢印っぽい要素を広範囲に検索
+                    const arrowSelectors = [
+                        'path', 'circle', 'polygon', 'rect',
+                        '[class*="arrow"]', '[class*="trade"]', '[class*="position"]',
+                        '[class*="buy"]', '[class*="sell"]', '[class*="up"]', '[class*="down"]',
+                        '[style*="fill"]', '[fill]', '[stroke]'
+                    ];
+                    
+                    arrowSelectors.forEach(selector => {
+                        try {
+                            const elements = document.querySelectorAll(selector);
+                            elements.forEach((el, idx) => {
+                                const style = window.getComputedStyle(el);
+                                const fill = style.fill || el.getAttribute('fill') || '';
+                                const stroke = style.stroke || el.getAttribute('stroke') || '';
+                                const color = style.color || el.getAttribute('color') || '';
+                                const backgroundColor = style.backgroundColor || '';
+                                
+                                // 色が設定されている要素のみ
+                                if (fill !== 'none' && fill !== '' || stroke !== 'none' && stroke !== '' || 
+                                    color !== '' || backgroundColor !== '') {
+                                    const rect = el.getBoundingClientRect();
+                                    analysis.allElements.push({
+                                        selector: selector,
+                                        tagName: el.tagName,
+                                        classes: el.className.baseVal || el.className || '',
+                                        id: el.id || '',
+                                        fill: fill,
+                                        stroke: stroke,
+                                        color: color,
+                                        backgroundColor: backgroundColor,
+                                        x: rect.x,
+                                        y: rect.y,
+                                        width: rect.width,
+                                        height: rect.height,
+                                        innerHTML: el.innerHTML ? el.innerHTML.substring(0, 100) : ''
+                                    });
+                                }
+                            });
+                        } catch(e) {}
+                    });
+                    
+                    return analysis;
+                }
+            """)
+            
+            print(f"[🔍 ANALYSIS] ページ構造解析結果:")
+            print(f"  📊 SVG要素: {len(page_analysis['svgs'])}個")
+            print(f"  🎨 Canvas要素: {len(page_analysis['canvases'])}個")
+            print(f"  📈 チャート要素: {len(page_analysis['charts'])}個")
+            print(f"  🎯 矢印候補: {len(page_analysis['allElements'])}個")
+            
+            # SVG詳細表示
+            if page_analysis['svgs']:
+                print(f"\n[📊 SVG DETAILS]")
+                for svg in page_analysis['svgs'][:5]:  # 最初の5個
+                    print(f"  SVG#{svg['index']}: {svg['width']}x{svg['height']} at ({svg['x']:.0f},{svg['y']:.0f})")
+                    print(f"    Classes: {svg['classes']}")
+                    print(f"    ID: {svg['id']}")
+                    print(f"    Children: {svg['children']}")
+                    print(f"    HTML: {svg['innerHTML'][:100]}...")
+            
+            # Canvas詳細表示
+            if page_analysis['canvases']:
+                print(f"\n[🎨 CANVAS DETAILS]")
+                for canvas in page_analysis['canvases'][:3]:
+                    print(f"  Canvas#{canvas['index']}: {canvas['width']}x{canvas['height']} at ({canvas['x']:.0f},{canvas['y']:.0f})")
+                    print(f"    Classes: {canvas['classes']}")
+                    print(f"    ID: {canvas['id']}")
+            
+            # チャート要素詳細表示
+            if page_analysis['charts']:
+                print(f"\n[📈 CHART ELEMENTS]")
+                for chart in page_analysis['charts'][:3]:
+                    print(f"  {chart['tagName']}: {chart['width']:.0f}x{chart['height']:.0f}")
+                    print(f"    Classes: {chart['classes']}")
+                    print(f"    ID: {chart['id']}")
+                    print(f"    Children: {chart['children']}")
+            
+            # 色付き要素の詳細表示
+            if page_analysis['allElements']:
+                print(f"\n[🎯 COLORED ELEMENTS (first 10)]")
+                for el in page_analysis['allElements'][:10]:
+                    if el['width'] > 5 and el['height'] > 5:  # 小さすぎる要素は除外
+                        print(f"  {el['tagName']}: {el['width']:.0f}x{el['height']:.0f} at ({el['x']:.0f},{el['y']:.0f})")
+                        print(f"    Classes: {el['classes']}")
+                        if el['fill'] and el['fill'] != 'none':
+                            print(f"    Fill: {el['fill']}")
+                        if el['stroke'] and el['stroke'] != 'none':
+                            print(f"    Stroke: {el['stroke']}")
+                        if el['backgroundColor']:
+                            print(f"    BgColor: {el['backgroundColor']}")
+            
+            # 矢印らしい要素を特定
+            potential_arrows = []
+            for el in page_analysis['allElements']:
+                # 実際の矢印の条件：
+                # 1. 適度な小さいサイズ（実際の矢印は小さな円形）
+                # 2. チャート領域内（価格ライン上）
+                # 3. text要素やrect要素は除外（これらはUIパーツ）
+                if (5 <= el['width'] <= 25 and 5 <= el['height'] <= 25 and 
+                    50 <= el['x'] <= 800 and 200 <= el['y'] <= 650 and  # チャート内の価格ライン付近
+                    el['tagName'].lower() not in ['text', 'rect']):  # UI要素を除外
+                    
+                    # 色による判定（より柔軟に）
+                    result = None
+                    
+                    # 色情報を安全に文字列化
+                    fill = str(el.get('fill', ''))
+                    stroke = str(el.get('stroke', ''))
+                    backgroundColor = str(el.get('backgroundColor', ''))
+                    color = str(el.get('color', ''))
+                    all_colors = f"{fill} {stroke} {backgroundColor} {color}".lower()
+                    
+                    # 実際の矢印の色パターン（TheOptionの実際の仕様に合わせて修正）
+                    
+                    # グレー系の色（負け矢印）- TheOptionでは負けは全てグレー表示
+                    gray_patterns = [
+                        'gray', 'grey', '#666', '#999', '#ccc', '#808080', '#888', '#aaa',
+                        'rgb(128', 'rgb(169', 'rgb(192', 'rgb(105', 'rgb(92, 91, 91)',
+                        'rgba(128', 'rgba(169', 'rgba(192', 'rgba(105',
+                        '92, 91, 91', 'rgb(78, 71, 78)',  # 実際に検出されたグレー色
+                        'rgb(13, 159, 27)'  # 実は負けの場合もこの色で表示される？要検証
+                    ]
+                    
+                    # 緑系の色（勝ち矢印）- ただし現在の状況では検証が必要
+                    green_win_patterns = [
+                        'green', '#00ff00', '#0f0', 'rgb(0, 255, 0)', 'rgb(0, 128, 0)',
+                        'rgb(34, 139, 34)', '#228b22', '#006400', '#32cd32'
+                        # rgb(13, 159, 27) は一時的に除外して検証
+                    ]
+                    
+                    # 赤系の色（勝ち矢印）
+                    red_patterns = [
+                        'red', '#ff0000', '#f00', 'rgb(255, 0, 0)', 'rgb(220, 20, 60)',
+                        'rgb(255,', '#dc143c', '#b22222', '#8b0000'
+                    ]
+                    
+                    # 白い背景の矢印（矢印の背景部分）
+                    white_patterns = [
+                        'rgb(255, 255, 255)', '#ffffff', '#fff', 'white',
+                        'rgba(255, 255, 255'
+                    ]
+                    
+                    # 青系の色（特殊な矢印または現在位置マーカー）
+                    blue_patterns = [
+                        'blue', 'rgb(2, 62, 210)', '#0000ff', '#00f'
+                    ]
+                    
+                    # 矢印らしい要素の判定
+                    is_arrow_like = False
+                    
+                    # 色による判定（TheOptionの実際の表示に基づく）
+                    # 現在表示されている状況から判断すると、検出された矢印は全て負けの可能性が高い
+                    
+                    if any(pattern in all_colors for pattern in gray_patterns):
+                        result = 'loss'
+                        is_arrow_like = True
+                    elif any(pattern in all_colors for pattern in green_win_patterns):
+                        result = 'win'  
+                        is_arrow_like = True
+                    elif any(pattern in all_colors for pattern in red_patterns):
+                        result = 'win'  
+                        is_arrow_like = True
+                    elif any(pattern in all_colors for pattern in blue_patterns):
+                        result = 'unknown'  # 青は特殊マーカー、矢印ではない可能性
+                        is_arrow_like = False  # 青いマーカーは除外
+                    elif any(pattern in all_colors for pattern in white_patterns):
+                        # 白い要素は矢印の背景部分の可能性
+                        # path要素で小さければ矢印の一部
+                        if el['tagName'].lower() == 'path' and el['width'] <= 15 and el['height'] <= 15:
+                            result = 'unknown'  # 色が不明なので判定保留
+                            is_arrow_like = True
+                        else:
+                            is_arrow_like = False
+                    
+                    # 緊急モード: 全ての検出された矢印を負けとして扱う
+                    if EMERGENCY_MODE:
+                        # 円形要素または小さなpath要素であれば矢印として認識
+                        if (el['tagName'].lower() in ['circle', 'path'] and 
+                            5 <= el['width'] <= 20 and 5 <= el['height'] <= 20 and
+                            not any(pattern in all_colors for pattern in blue_patterns)):
+                            result = 'loss'  # 緊急モードでは全て負け
+                            is_arrow_like = True
+                    else:
+                        # 通常モードの判定
+                        # 特別な処理: 現在の状況では rgb(13, 159, 27) を負けとして扱う
+                        if 'rgb(13, 159, 27)' in all_colors:
+                            result = 'loss'  # 現在の表示状況から負けと判定
+                            is_arrow_like = True
+                    
+                    # 特定の形状やクラス名で矢印を判定
+                    classes_str = str(el.get('classes', ''))
+                    if any(keyword in classes_str.lower() for keyword in ['arrow', 'marker', 'indicator', 'signal']):
+                        if not EMERGENCY_MODE:
+                            is_arrow_like = True
+                            if not result:
+                                result = 'unknown'
+                    
+                    # 現在位置マーカーは除外
+                    if 'current-coordinate' in classes_str:
+                        is_arrow_like = False
+                    
+                    # circle要素の場合（矢印の背景円）
+                    if el['tagName'].lower() == 'circle' and not EMERGENCY_MODE:
+                        # 緑・赤・グレーの円は矢印
+                        if result in ['win', 'loss']:
+                            is_arrow_like = True
+                        # 青い円（現在位置マーカーなど）は除外
+                        elif any(pattern in all_colors for pattern in blue_patterns):
+                            is_arrow_like = False
+                        else:
+                            is_arrow_like = False
+                    
+                    # path要素で小さなもの（矢印の形状部分）
+                    if (el['tagName'].lower() == 'path' and 
+                        5 <= el['width'] <= 20 and 5 <= el['height'] <= 20 and
+                        not EMERGENCY_MODE):
+                        if result:
+                            is_arrow_like = True
+                    
+                    # 条件に合致した要素のみを候補とする
+                    if is_arrow_like and result:
+                        potential_arrows.append({
+                            'result': result,
+                            'x': el['x'],
+                            'y': el['y'],
+                            'width': el['width'],
+                            'height': el['height'],
+                            'colors': all_colors,
+                            'tagName': el['tagName'],
+                            'element': el
+                        })
+            
+            # 重複要素を除外（同じ位置にあるpath要素とcircle要素）
+            unique_arrows = []
+            for arrow in potential_arrows:
+                # 同じ位置（±5px以内）に既存の矢印がないかチェック
+                is_duplicate = False
+                for existing in unique_arrows:
+                    if (abs(arrow['x'] - existing['x']) <= 5 and 
+                        abs(arrow['y'] - existing['y']) <= 5):
+                        # 既存の矢印と重複している場合
+                        # より確実な判定結果（win/loss）を優先
+                        if arrow['result'] in ['win', 'loss'] and existing['result'] == 'unknown':
+                            # 新しい矢印の方が確実な結果なので置き換える
+                            unique_arrows[unique_arrows.index(existing)] = arrow
+                        is_duplicate = True
+                        break
+                
+                if not is_duplicate:
+                    unique_arrows.append(arrow)
+            
+            potential_arrows = unique_arrows
+            
+            print(f"\n[🎯 ARROW CANDIDATES] 矢印候補の詳細 (重複除去後):")
+            for idx, arrow in enumerate(potential_arrows):
+                print(f"  Arrow #{idx+1}: {arrow['result']} at ({arrow['x']:.0f},{arrow['y']:.0f}) size={arrow['width']:.0f}x{arrow['height']:.0f}")
+                print(f"    Tag: {arrow['tagName']}, Colors: {arrow['colors']}")
+                print(f"    Classes: {arrow['element']['classes']}")
+            
+            # 実際の矢印が見つからない場合の詳細解析
+            if len(potential_arrows) < 5:
+                print(f"\n[🔍 DETAILED SEARCH] 矢印候補が少ないため詳細解析を実行...")
+                
+                # チャート領域内の全ての小要素を表示
+                chart_small_elements = [el for el in page_analysis['allElements'] 
+                                      if 50 <= el['x'] <= 800 and 200 <= el['y'] <= 650  # チャート領域
+                                      and 5 <= el['width'] <= 30 and 5 <= el['height'] <= 30]  # 小要素
+                
+                print(f"[📊 CHART SMALL] チャート内小要素: {len(chart_small_elements)}個")
+                for idx, el in enumerate(chart_small_elements[:10]):  # 最初の10個
+                    fill = str(el.get('fill', ''))
+                    stroke = str(el.get('stroke', ''))
+                    colors = f"fill:{fill}, stroke:{stroke}"
+                    print(f"  #{idx+1}: {el['tagName']} {el['width']:.0f}x{el['height']:.0f} at ({el['x']:.0f},{el['y']:.0f})")
+                    print(f"    {colors}")
+                    print(f"    Classes: {el['classes']}")
+            
+            # X座標でソート（右から左へ）
+            potential_arrows.sort(key=lambda x: x['x'], reverse=True)
+            
+            # 最新10個の矢印のみを使用（unknownを除外）
+            definite_arrows = [arrow for arrow in potential_arrows if arrow['result'] in ['win', 'loss']]
+            recent_arrows = definite_arrows[:10]
+            
+            print(f"\n[🏆 FINAL ARROWS] 最新10個の確定矢印:")
+            
+            arrow_results = []
+            for idx, arrow in enumerate(recent_arrows):
+                arrow_results.append(arrow['result'])
+                status_emoji = "💀" if arrow['result'] == 'loss' else "✅" if arrow['result'] == 'win' else "❓"
+                print(f"  {status_emoji} #{idx+1}: {arrow['result']} at ({arrow['x']:.0f},{arrow['y']:.0f})")
+            
+            print(f"\n[📊 FINAL RESULT] 検出された確定矢印: {len(arrow_results)}個")
+            if EMERGENCY_MODE:
+                print(f"[🚨 EMERGENCY MODE] 全ての矢印を負けとして判定中")
+                
+            if len(arrow_results) >= 10:
+                loss_count = arrow_results.count('loss')
+                win_count = arrow_results.count('win')
+                print(f"[📊 ANALYSIS] 勝ち: {win_count}個, 負け: {loss_count}個 / 10個")
+                if loss_count >= RECENT_LOSS_THRESHOLD:
+                    print(f"[🚫 BLOCK] {loss_count}個の負け ≥ {RECENT_LOSS_THRESHOLD}個 → ブロック発動")
+                else:
+                    print(f"[🟢 OK] {loss_count}個の負け < {RECENT_LOSS_THRESHOLD}個 → 取引継続")
+            else:
+                print(f"[⚠️ INSUFFICIENT] 確定矢印が{len(arrow_results)}個のみ（10個必要）")
+                print(f"[📋 FALLBACK] 手動記録システムを使用してください")
+                # 矢印が少ない場合は空のリストを返す（ブロックしない）
+                return []
+            
+            return arrow_results
+            
+            print(f"\n[🎯 POTENTIAL ARROWS] 矢印候補: {len(potential_arrows)}個")
+            for idx, arrow in enumerate(potential_arrows[:15]):
+                el = arrow['element']
+                status_emoji = "❌" if arrow['result'] == 'loss' else "✅"
+                print(f"  [{status_emoji} #{idx+1}] {arrow['result']} at ({arrow['x']:.0f},{arrow['y']:.0f})")
+                print(f"    {el['tagName']} - Classes: {el['classes']}")
+                print(f"    Fill: {el['fill']}, Stroke: {el['stroke']}, BgColor: {el['backgroundColor']}")
+            
+            # 結果リストを作成
+            results = [arrow['result'] for arrow in potential_arrows]
+            
+        except Exception as js_error:
+            print(f"[ERROR] JavaScript解析エラー: {js_error}")
+            import traceback
+            print(traceback.format_exc())
+        
+        print(f"\n[📊 FINAL RESULT] 検出された矢印: {len(results)}個")
+        if len(results) >= RECENT_CHECK_COUNT:
+            recent_10 = results[:RECENT_CHECK_COUNT]
+            loss_count = sum(1 for r in recent_10 if r == 'loss')
+            print(f"[📈 SUMMARY] 直近{RECENT_CHECK_COUNT}個: 勝ち{RECENT_CHECK_COUNT-loss_count}個, 負け{loss_count}個")
+        else:
+            print(f"[⚠️ INSUFFICIENT] 矢印が{len(results)}個のみ（{RECENT_CHECK_COUNT}個必要）")
+        
+        return results
+        
+    except Exception as e:
+        print(f"[❌ CHART ERROR] チャート矢印解析エラー: {e}")
+        import traceback
+        print(traceback.format_exc())
+        return []
+
 def scrape_trade_results(page):
     """
-    Webページから取引結果をスクレイピング（TheOption専用）
+    Webページから取引結果をスクレイピング（チャート矢印版）
     Args:
         page: Playwrightのページオブジェクト
     Returns:
         list: [(entry_time, action_str, result, entry_price), ...]
     """
     try:
-        results = []
+        # チャート上の矢印を解析
+        arrow_results = scrape_chart_arrows(page)
         
-        # TheOptionの取引履歴要素を探す
-        trade_history_selectors = [
-            # TheOption特有のセレクタ
-            '.trading-history-item',
-            '.history-item',
-            '.trade-item',
-            '[class*="history"]',
-            '[class*="trade-history"]',
-            '[class*="transaction"]',
-            # 一般的なセレクタ
-            '.trade-history-item',
-            '.transaction-item',
-            '[class*="trade"][class*="row"]',
-            '[class*="history"][class*="item"]',
-            # テーブル形式の場合
-            'table tbody tr',
-            '.table-row',
-            # リスト形式の場合
-            'ul li[class*="trade"]',
-            'ul li[class*="history"]'
-        ]
+        # 従来の取引履歴も確認（参考用）
+        print(f"\n[📋 BACKUP] 取引履歴パネルも確認...")
         
-        print(f"\n[🔍 SCRAPE] 取引履歴の検索を開始...")
+        return []  # チャート解析結果は別途処理
         
-        # ページ全体のHTMLを確認（デバッグ用）
-        try:
-            # 取引履歴パネルを開く試み
-            history_buttons = [
-                'button:has-text("履歴")',
-                'button:has-text("History")',
-                '[class*="history"][class*="button"]',
-                '[class*="history"][class*="tab"]'
-            ]
-            
-            for btn_selector in history_buttons:
-                btn = page.query_selector(btn_selector)
-                if btn:
-                    print(f"[SCRAPE] 履歴ボタンを発見: {btn_selector}")
-                    try:
-                        if btn.is_visible():
-                            btn.click()
-                            print(f"[SCRAPE] 履歴パネルを開きました")
-                            time.sleep(0.5)
-                            break
-                    except:
-                        pass
-        except Exception as e:
-            print(f"[SCRAPE] 履歴パネルを開けませんでした: {e}")
-        
-        # すべてのセレクタを試す
-        for selector in trade_history_selectors:
-            items = page.query_selector_all(selector)
-            if items and len(items) > 0:
-                print(f"[✓ SCRAPE] 取引履歴を{len(items)}件検出: {selector}")
-                for idx, item in enumerate(items[:10]):  # 最新10件のみ
-                    try:
-                        # テキストを取得
-                        text = item.inner_text().strip()
-                        html = item.inner_html()[:200]  # 最初の200文字
-                        
-                        print(f"\n[📄 SCRAPE #{idx+1}] テキスト: {text}")
-                        print(f"[📄 SCRAPE #{idx+1}] HTML: {html}...")
-                        
-                        # クラス名を確認
-                        class_name = item.get_attribute('class') or ''
-                        print(f"[📄 SCRAPE #{idx+1}] クラス: {class_name}")
-                        
-                        # 子要素を確認
-                        children = item.query_selector_all('*')
-                        print(f"[📄 SCRAPE #{idx+1}] 子要素数: {len(children)}")
-                        
-                    except Exception as e:
-                        print(f"[SCRAPE ERROR] アイテム{idx+1}の解析エラー: {e}")
-                        continue
-                break
-        else:
-            print(f"[⚠ SCRAPE] 取引履歴が見つかりませんでした")
-            print(f"[SCRAPE] ページのすべてのクラス名を確認中...")
-            
-            # ページ内のすべての要素のクラス名をリストアップ
-            all_elements = page.query_selector_all('[class*="trade"], [class*="history"], [class*="transaction"]')
-            print(f"[SCRAPE] 'trade', 'history', 'transaction'を含む要素: {len(all_elements)}件")
-            for elem in all_elements[:20]:
-                class_name = elem.get_attribute('class') or ''
-                if class_name:
-                    print(f"[SCRAPE] クラス: {class_name}")
-        
-        return results
     except Exception as e:
         print(f"[❌ SCRAPE ERROR] 取引結果スクレイピングエラー: {e}")
         import traceback
@@ -1211,8 +1577,23 @@ def check_trade_result(entry_time, action_str, entry_price, loss_history_ref, pa
                 if result_status == 'loss':
                     loss_history_ref.append((entry_time, action_str, 'loss', entry_price))
                     print(f"[❌ RESULT] 負け記録追加: {action_str} @ {entry_price:.3f}")
+                    # append recent outcome and evaluate
+                    try:
+                        recent_trade_outcomes.append('loss')
+                        print(f"[RECENT] recent_trade_outcomes: {list(recent_trade_outcomes)}")
+                        paused, triggered = evaluate_recent_outcomes_and_pause(recent_trade_outcomes)
+                        if triggered:
+                            global trading_paused_until
+                            trading_paused_until = paused
+                    except Exception as e:
+                        print(f"[WARN] recent append failed: {e}")
                 else:
                     print(f"[✅ RESULT] 勝ち: {action_str} @ {entry_price:.3f}")
+                    try:
+                        recent_trade_outcomes.append('win')
+                        print(f"[RECENT] recent_trade_outcomes: {list(recent_trade_outcomes)}")
+                    except Exception:
+                        pass
                 break
         
         if not found:
@@ -1256,6 +1637,77 @@ def add_loss_to_history(loss_history, action_str, entry_price, entry_time=None):
     if cleaned > 0:
         print(f"[🗑️ CLEANUP] 古い履歴{cleaned}件を削除しました")
 
+    # recent_trade_outcomesに'loss'を追加して評価
+    try:
+        recent_trade_outcomes.append('loss')
+        print(f"[RECENT] recent_trade_outcomes: {list(recent_trade_outcomes)}")
+        paused, triggered = evaluate_recent_outcomes_and_pause(recent_trade_outcomes)
+        if triggered:
+            global trading_paused_until
+            trading_paused_until = paused
+    except Exception as e:
+        print(f"[WARN] recent outcome append failed: {e}")
+
+
+def evaluate_chart_arrows_and_pause(page):
+    """
+    チャート矢印を解析して必要に応じてトレードを一時停止
+    Args:
+        page: Playwrightのページオブジェクト
+    Returns: (paused_until_datetime or None, triggered_bool)
+    """
+    try:
+        # チャート矢印を解析
+        arrow_results = scrape_chart_arrows(page)
+        
+        if len(arrow_results) >= RECENT_CHECK_COUNT:
+            # 直近10個を評価
+            recent_10 = arrow_results[:RECENT_CHECK_COUNT]
+            loss_count = sum(1 for r in recent_10 if r == 'loss')
+            
+            print(f"\n[🎯 ARROW EVAL] 直近{RECENT_CHECK_COUNT}個の矢印評価:")
+            print(f"  - 勝ち（赤・緑）: {RECENT_CHECK_COUNT - loss_count}個")
+            print(f"  - 負け（グレー）: {loss_count}個")
+            print(f"  - 配列: {' '.join(['🔴' if r == 'win' else '⚪' for r in recent_10])}")
+            
+            if loss_count >= RECENT_LOSS_THRESHOLD:
+                paused_until = datetime.now() + timedelta(seconds=RECENT_BLOCK_SECONDS)
+                print(f"\n[🚫 PAUSE] グレー矢印が{loss_count}個/{RECENT_CHECK_COUNT}個 (>={RECENT_LOSS_THRESHOLD}) => トレードを{RECENT_BLOCK_SECONDS}秒間停止")
+                print(f"[⏰ PAUSE] 停止終了予定: {paused_until.strftime('%H:%M:%S')}")
+                return paused_until, True
+            else:
+                print(f"[✅ CONTINUE] グレー矢印が{loss_count}個/{RECENT_CHECK_COUNT}個 (<{RECENT_LOSS_THRESHOLD}) => 取引継続可能")
+                return None, False
+        else:
+            print(f"[⚠️ INSUFFICIENT] 矢印データ不足: {len(arrow_results)}個/{RECENT_CHECK_COUNT}個必要")
+            return None, False
+            
+    except Exception as e:
+        print(f"[ERROR] evaluate_chart_arrows_and_pause error: {e}")
+        import traceback
+        print(traceback.format_exc())
+        return None, False
+
+def evaluate_recent_outcomes_and_pause(recent_trade_outcomes, trading_paused_until_ref=None):
+    """
+    recent_trade_outcomes: deque of 'win'/'loss' (手動記録用・互換性維持)
+    trading_paused_until_ref: a reference (mutable) to update paused-until timestamp (pass by name)
+    Returns: (paused_until_datetime or None, triggered_bool)
+    """
+    try:
+        outcomes = list(recent_trade_outcomes)
+        if len(outcomes) < RECENT_CHECK_COUNT:
+            return None, False
+        losses = sum(1 for o in outcomes if o == 'loss')
+        if losses >= RECENT_LOSS_THRESHOLD:
+            paused_until = datetime.now() + timedelta(seconds=RECENT_BLOCK_SECONDS)
+            print(f"[PAUSE] 手動記録: 直近{RECENT_CHECK_COUNT}回で{losses}回の負け => トレードを{RECENT_BLOCK_SECONDS}秒間停止します（{paused_until.strftime('%H:%M:%S')}まで）")
+            return paused_until, True
+        return None, False
+    except Exception as e:
+        print(f"[ERROR] evaluate_recent_outcomes_and_pause error: {e}")
+        return None, False
+
 def add_last_trade_loss(loss_history, pending_trades):
     """
     直近のエントリーを負けとして記録する簡易関数
@@ -1276,6 +1728,42 @@ def add_last_trade_loss(loss_history, pending_trades):
         print(f"[INFO] 直接記録する場合:")
         print(f"  add_loss_to_history(loss_history, 'High', 150.123)  # High負け")
         print(f"  add_loss_to_history(loss_history, 'Low', 150.123)   # Low負け")
+
+def test_chart_analysis(page):
+    """
+    チャート解析のテスト用関数
+    Args:
+        page: Playwrightのページオブジェクト
+    """
+    try:
+        print(f"\n[🧪 TEST] チャート解析テストを実行...")
+        results = scrape_chart_arrows(page)
+        print(f"[TEST] 結果: {len(results)}個の矢印を検出")
+        if results:
+            print(f"[TEST] 矢印データ: {results[:10]}")
+        return results
+    except Exception as e:
+        print(f"[TEST ERROR] テストエラー: {e}")
+        return []
+
+def manual_add_arrow_result(result_type):
+    """
+    手動で矢印結果を追加（テスト用）
+    Args:
+        result_type: 'win' or 'loss'
+    """
+    try:
+        recent_trade_outcomes.append(result_type)
+        print(f"[MANUAL ARROW] {result_type}を追加: {list(recent_trade_outcomes)}")
+        
+        # ブロック判定
+        paused, triggered = evaluate_recent_outcomes_and_pause(recent_trade_outcomes)
+        if triggered:
+            global trading_paused_until
+            trading_paused_until = paused
+            print(f"[MANUAL TRIGGER] トレード一時停止発動")
+    except Exception as e:
+        print(f"[MANUAL ERROR] 手動追加エラー: {e}")
 
 def _log_signal(ts, price, phase, q_values, action_idx, action_str, entry, reason, slope_info=None):
     try:
@@ -1418,6 +1906,7 @@ with sync_playwright() as p:
     all_ticks = []
     loss_history = []  # 負け履歴: [(datetime, action_str, result, entry_price), ...]
     pending_trades = []  # エントリー待ちの取引: [(entry_time, action_str, entry_price), ...]
+    # recent_trade_outcomes and trading_paused_until are module-level
     last_entry_time = None
     next_entry_allowed_time = None
     recent_prices = deque(maxlen= int(10 / max(TICK_INTERVAL_SECONDS, 0.001)) + 2)
@@ -1441,10 +1930,28 @@ with sync_playwright() as p:
     print("  >>> past_time = datetime.now() - timedelta(minutes=2)")
     print("  >>> add_loss_to_history(loss_history, 'High', 150.123, past_time)")
     print("")
-    print("🔥 連敗フィルター設定:")
+    print("【チャート矢印テスト用】🧪")
+    print("  現在のチャート解析をテスト:")
+    print("    >>> test_chart_analysis(page)")
+    print("  手動で矢印結果を追加:")
+    print("    >>> manual_add_arrow_result('loss')  # グレー矢印")
+    print("    >>> manual_add_arrow_result('win')   # 赤・緑矢印")
+    print("")
+    print("🔥 フィルター設定:")
+    print(f"【従来の連敗フィルター】")
     print(f"  - 連続負け閾値: {CONSECUTIVE_LOSS_THRESHOLD}回")
     print(f"  - ブロック時間: {ENTRY_BLOCK_DURATION_SECONDS}秒（{ENTRY_BLOCK_DURATION_SECONDS//60}分）")
     print(f"  - 履歴参照期間: {LOSS_LOOKBACK_MINUTES}分")
+    print(f"【新・チャート矢印フィルター】🎯")
+    print(f"  - 右から矢印{RECENT_CHECK_COUNT}個をチェック")
+    print(f"  - グレー矢印が{RECENT_LOSS_THRESHOLD}個以上でブロック")
+    print(f"  - ブロック時間: {RECENT_BLOCK_SECONDS}秒（{RECENT_BLOCK_SECONDS//60}分）")
+    print(f"  - 自動解析: 10秒ごとにチャート確認")
+    print("")
+    print("🎯 直近矢印フィルター設定:")
+    print(f"  - 確認する矢印数: {RECENT_CHECK_COUNT}回")
+    print(f"  - 負け閾値: {RECENT_LOSS_THRESHOLD}回以上")
+    print(f"  - ブロック時間: {RECENT_BLOCK_SECONDS}秒（{RECENT_BLOCK_SECONDS//60}分）")
     print("")
     print("※取引結果は60秒後に自動確認を試みますが、")
     print("  確実に記録したい場合は上記コマンドで手動登録してください。")
@@ -1586,6 +2093,22 @@ with sync_playwright() as p:
                 time.sleep(TICK_INTERVAL_SECONDS)
                 continue
 
+            # チャート矢印を定期的にチェック（10秒ごと）
+            if current_time.second % 10 < TICK_INTERVAL_SECONDS:
+                try:
+                    paused_until, triggered = evaluate_chart_arrows_and_pause(page)
+                    if triggered:
+                        trading_paused_until = paused_until
+                        print(f"[🚫 CHART BLOCK] チャート矢印によりトレード一時停止")
+                    elif trading_paused_until and current_time >= trading_paused_until:
+                        # 一時停止期間が終了した場合
+                        print(f"[✅ CHART UNBLOCK] チャート矢印ブロック解除")
+                        trading_paused_until = None
+                except Exception as e:
+                    print(f"[WARN] チャート矢印評価エラー: {e}")
+                    # エラー時は手動記録モードにフォールバック
+                    print(f"[INFO] 手動記録モードで継続します")
+
             # 価格傾きと負け履歴分析を実行
             price_history = [t[1] for t in all_ticks[-TREND_LOOKBACK_PERIODS:]] if len(all_ticks) >= TREND_LOOKBACK_PERIODS else [t[1] for t in all_ticks]
             time_history = [t[0] for t in all_ticks[-TREND_LOOKBACK_PERIODS:]] if len(all_ticks) >= TREND_LOOKBACK_PERIODS else [t[0] for t in all_ticks]
@@ -1650,8 +2173,14 @@ with sync_playwright() as p:
                 # optionally require q advantage over hold
                 q_advantage = q_values[action_idx] - q_values[0]
                 if q_advantage >= DQN_Q_MARGIN:
+                    # trading pause check (chart arrows or manual losses)
+                    if trading_paused_until and current_time < trading_paused_until:
+                        remaining = int((trading_paused_until - current_time).total_seconds())
+                        reason = f"chart_arrow_pause_{remaining}s"
+                        entry = False
+                        print(f"[⏸️ PAUSE] {action_str} - チャート矢印(グレー矢印多数)によりトレード停止中 (残り{remaining}秒, {trading_paused_until.strftime('%H:%M:%S')}まで)")
                     # cooldown check
-                    if next_entry_allowed_time and current_time < next_entry_allowed_time:
+                    elif next_entry_allowed_time and current_time < next_entry_allowed_time:
                         reason = "cooldown"
                         entry = False
                         print(f"[{current_time.strftime('%H:%M:%S')}] {action_str} - クールダウン中 (残り{(next_entry_allowed_time-current_time).total_seconds():.1f}秒)")
@@ -1710,22 +2239,45 @@ with sync_playwright() as p:
                     elapsed = int((current_time - trade_time).total_seconds())
                     print(f"  - {trade_action} @ {trade_price:.3f} ({trade_time.strftime('%H:%M:%S')}, {elapsed}秒経過)")
             
-            # 負け履歴の状態を定期的に表示（30秒ごと）
-            if current_time.second % 30 < TICK_INTERVAL_SECONDS and loss_history:
-                cutoff = current_time - timedelta(minutes=LOSS_LOOKBACK_MINUTES)
-                recent_losses = [l for l in loss_history if l[0] > cutoff]
-                high_losses = sum(1 for _, a, _, _ in recent_losses if a == 'High')
-                low_losses = sum(1 for _, a, _, _ in recent_losses if a == 'Low')
+            # 状態を定期的に表示（30秒ごと）
+            if current_time.second % 30 < TICK_INTERVAL_SECONDS:
+                print(f"\n[📊 STATUS] システム状態")
                 
-                print(f"\n[📊 LOSS HISTORY] 直近{LOSS_LOOKBACK_MINUTES}分間の負け履歴")
-                print(f"  - High負け: {high_losses}回 {'🚫ブロック対象' if high_losses >= CONSECUTIVE_LOSS_THRESHOLD else ''}")
-                print(f"  - Low負け: {low_losses}回 {'🚫ブロック対象' if low_losses >= CONSECUTIVE_LOSS_THRESHOLD else ''}")
+                # チャート矢印による一時停止状態
+                if trading_paused_until:
+                    if current_time < trading_paused_until:
+                        remaining = int((trading_paused_until - current_time).total_seconds())
+                        print(f"  🚫 チャート矢印ブロック: 残り{remaining}秒 ({trading_paused_until.strftime('%H:%M:%S')}まで)")
+                    else:
+                        print(f"  ✅ チャート矢印ブロック: 解除済み")
+                        trading_paused_until = None  # クリア
+                else:
+                    print(f"  ✅ チャート矢印ブロック: なし")
                 
-                if recent_losses:
-                    print(f"  - 最新の負け:")
-                    for loss_time, loss_action, _, loss_price in recent_losses[-3:]:
-                        mins_ago = int((current_time - loss_time).total_seconds() / 60)
-                        print(f"    {loss_action} @ {loss_price:.3f} ({mins_ago}分前)")
+                # 手動負け履歴
+                if loss_history:
+                    cutoff = current_time - timedelta(minutes=LOSS_LOOKBACK_MINUTES)
+                    recent_losses = [l for l in loss_history if l[0] > cutoff]
+                    high_losses = sum(1 for _, a, _, _ in recent_losses if a == 'High')
+                    low_losses = sum(1 for _, a, _, _ in recent_losses if a == 'Low')
+                    
+                    print(f"  📋 手動負け履歴 (直近{LOSS_LOOKBACK_MINUTES}分):")
+                    print(f"    - High負け: {high_losses}回 {'🚫ブロック対象' if high_losses >= CONSECUTIVE_LOSS_THRESHOLD else ''}")
+                    print(f"    - Low負け: {low_losses}回 {'🚫ブロック対象' if low_losses >= CONSECUTIVE_LOSS_THRESHOLD else ''}")
+                else:
+                    print(f"  📋 手動負け履歴: なし")
+                
+                # recent arrow status
+                recent_outcomes = list(recent_trade_outcomes)
+                recent_loss_count = sum(1 for o in recent_outcomes if o == 'loss')
+                print(f"\n[🎯 RECENT ARROWS] 直近{len(recent_outcomes)}/{RECENT_CHECK_COUNT}回の結果")
+                print(f"  - 負け: {recent_loss_count}回 {'🚫ブロック対象' if recent_loss_count >= RECENT_LOSS_THRESHOLD else ''}")
+                if recent_outcomes:
+                    arrows = ''.join(['❌' if o == 'loss' else '✅' for o in recent_outcomes[-10:]])
+                    print(f"  - 矢印: {arrows} (右から左へ)")
+                if trading_paused_until and current_time < trading_paused_until:
+                    remaining = int((trading_paused_until - current_time).total_seconds())
+                    print(f"  - ⏸️ トレード停止中: あと{remaining}秒")
             
             # prune ticks older than e.g. 2 hours to keep memory bounded
             two_hours_ago = current_time - timedelta(hours=2)
