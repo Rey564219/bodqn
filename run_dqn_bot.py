@@ -151,8 +151,10 @@ CONSECUTIVE_LOSS_THRESHOLD = 3  # 連続負け回数の閾値
 LOSS_LOOKBACK_MINUTES = 5  # 直近何分間の負け履歴を確認するか
 ENTRY_BLOCK_DURATION_SECONDS = 180  # 連敗時のエントリー停止時間（3分=180秒）
 # Recent-arrow based blocking (右から矢印を見て直近N回中M回負けたらブロック)
-RECENT_CHECK_COUNT = 10           # 右から見て何回分の矢印を見るか
-RECENT_LOSS_THRESHOLD = 6         # そのうち何回以上負けならブロックするか
+RECENT_CHECK_COUNT = 5            # 右から見て何回分の矢印を見るか（通常モード）
+RECENT_LOSS_THRESHOLD = 2         # そのうち何回以上負けならブロックするか（5件中2件=4割）
+MIN_CHECK_COUNT = 3               # 最低データ取得数
+MIN_LOSS_THRESHOLD = 2            # 最低データでの負け閾値（3件中2件=6割超）
 RECENT_BLOCK_SECONDS = 120        # 条件該当時にトレードを停止する秒数（2分）
 CHART_DEBUG_MODE = True           # チャート解析のデバッグモード
 
@@ -160,6 +162,10 @@ CHART_DEBUG_MODE = True           # チャート解析のデバッグモード
 recent_trade_outcomes = deque(maxlen=RECENT_CHECK_COUNT)
 # trading paused until (None or datetime)
 trading_paused_until = None
+# 最後のチャート解析時刻（重複実行防止用）
+last_chart_analysis_time = None
+# チャート上の矢印の総数（新しい矢印検出用）
+last_arrow_count = 0
 
 # -----------------------
 # FeatureExtraction（既存ロジック準拠）
@@ -1098,9 +1104,10 @@ def scrape_chart_arrows(page):
     """
     try:
         print(f"\n[🎯 CHART] チャート矢印の解析を開始...")
+        print("[🔺 TARGET] 三角矢印検出モード: 黒・グレー矢印は負け判定")
         
-        # 緊急モード: 明らかに負けている状況では全ての矢印を負けとして扱う
-        EMERGENCY_MODE = True  # 現在の状況では緊急モードを有効化
+        # 緊急モード: 全ての矢印を負けとして扱うデバッグモード（通常はFalse）
+        EMERGENCY_MODE = False  # 緊急モードを無効化（色による正確な判定を使用）
         if EMERGENCY_MODE:
             print("[🚨 EMERGENCY] 緊急モード: 検出された全ての矢印を負けとして判定")
         
@@ -1226,63 +1233,17 @@ def scrape_chart_arrows(page):
                 }
             """)
             
-            print(f"[🔍 ANALYSIS] ページ構造解析結果:")
-            print(f"  📊 SVG要素: {len(page_analysis['svgs'])}個")
-            print(f"  🎨 Canvas要素: {len(page_analysis['canvases'])}個")
-            print(f"  📈 チャート要素: {len(page_analysis['charts'])}個")
-            print(f"  🎯 矢印候補: {len(page_analysis['allElements'])}個")
-            
-            # SVG詳細表示
-            if page_analysis['svgs']:
-                print(f"\n[📊 SVG DETAILS]")
-                for svg in page_analysis['svgs'][:5]:  # 最初の5個
-                    print(f"  SVG#{svg['index']}: {svg['width']}x{svg['height']} at ({svg['x']:.0f},{svg['y']:.0f})")
-                    print(f"    Classes: {svg['classes']}")
-                    print(f"    ID: {svg['id']}")
-                    print(f"    Children: {svg['children']}")
-                    print(f"    HTML: {svg['innerHTML'][:100]}...")
-            
-            # Canvas詳細表示
-            if page_analysis['canvases']:
-                print(f"\n[🎨 CANVAS DETAILS]")
-                for canvas in page_analysis['canvases'][:3]:
-                    print(f"  Canvas#{canvas['index']}: {canvas['width']}x{canvas['height']} at ({canvas['x']:.0f},{canvas['y']:.0f})")
-                    print(f"    Classes: {canvas['classes']}")
-                    print(f"    ID: {canvas['id']}")
-            
-            # チャート要素詳細表示
-            if page_analysis['charts']:
-                print(f"\n[📈 CHART ELEMENTS]")
-                for chart in page_analysis['charts'][:3]:
-                    print(f"  {chart['tagName']}: {chart['width']:.0f}x{chart['height']:.0f}")
-                    print(f"    Classes: {chart['classes']}")
-                    print(f"    ID: {chart['id']}")
-                    print(f"    Children: {chart['children']}")
-            
-            # 色付き要素の詳細表示
-            if page_analysis['allElements']:
-                print(f"\n[🎯 COLORED ELEMENTS (first 10)]")
-                for el in page_analysis['allElements'][:10]:
-                    if el['width'] > 5 and el['height'] > 5:  # 小さすぎる要素は除外
-                        print(f"  {el['tagName']}: {el['width']:.0f}x{el['height']:.0f} at ({el['x']:.0f},{el['y']:.0f})")
-                        print(f"    Classes: {el['classes']}")
-                        if el['fill'] and el['fill'] != 'none':
-                            print(f"    Fill: {el['fill']}")
-                        if el['stroke'] and el['stroke'] != 'none':
-                            print(f"    Stroke: {el['stroke']}")
-                        if el['backgroundColor']:
-                            print(f"    BgColor: {el['backgroundColor']}")
-            
             # 矢印らしい要素を特定
             potential_arrows = []
             for el in page_analysis['allElements']:
                 # 実際の矢印の条件：
-                # 1. 適度な小さいサイズ（実際の矢印は小さな円形）
+                # 1. 適度な小さいサイズ（三角矢印は小さなpath要素やpolygon要素）
                 # 2. チャート領域内（価格ライン上）
                 # 3. text要素やrect要素は除外（これらはUIパーツ）
-                if (5 <= el['width'] <= 25 and 5 <= el['height'] <= 25 and 
-                    50 <= el['x'] <= 800 and 200 <= el['y'] <= 650 and  # チャート内の価格ライン付近
-                    el['tagName'].lower() not in ['text', 'rect']):  # UI要素を除外
+                if (3 <= el['width'] <= 30 and 3 <= el['height'] <= 30 and 
+                    50 <= el['x'] <= 850 and 200 <= el['y'] <= 700 and  # チャート内の価格ライン付近（範囲拡張）
+                    el['tagName'].lower() not in ['text', 'rect'] and  # UI要素を除外
+                    el['tagName'].lower() in ['path', 'polygon', 'circle']):  # 矢印の可能性がある要素タイプ
                     
                     # 色による判定（より柔軟に）
                     result = None
@@ -1296,26 +1257,39 @@ def scrape_chart_arrows(page):
                     
                     # 実際の矢印の色パターン（TheOptionの実際の仕様に合わせて修正）
                     
-                    # グレー系の色（負け矢印）- TheOptionでは負けは全てグレー表示
-                    gray_patterns = [
+                    # 負け矢印の色パターン（グレー系 + 黒系）
+                    loss_patterns = [
+                        # グレー系
                         'gray', 'grey', '#666', '#999', '#ccc', '#808080', '#888', '#aaa',
                         'rgb(128', 'rgb(169', 'rgb(192', 'rgb(105', 'rgb(92, 91, 91)',
                         'rgba(128', 'rgba(169', 'rgba(192', 'rgba(105',
                         '92, 91, 91', 'rgb(78, 71, 78)',  # 実際に検出されたグレー色
-                        'rgb(13, 159, 27)'  # 実は負けの場合もこの色で表示される？要検証
+                        # 黒系（負け矢印として追加）
+                        'black', '#000000', '#000', 'rgb(0, 0, 0)', 'rgba(0, 0, 0',
+                        'rgb(51, 51, 51)', 'rgb(33, 33, 33)'  # ダークグレー系も負け
                     ]
                     
-                    # 緑系の色（勝ち矢印）- ただし現在の状況では検証が必要
+                    # 緑系の色（勝ち矢印）- 実際に検出された緑色を含む
                     green_win_patterns = [
                         'green', '#00ff00', '#0f0', 'rgb(0, 255, 0)', 'rgb(0, 128, 0)',
-                        'rgb(34, 139, 34)', '#228b22', '#006400', '#32cd32'
-                        # rgb(13, 159, 27) は一時的に除外して検証
+                        'rgb(34, 139, 34)', '#228b22', '#006400', '#32cd32',
+                        'rgb(13, 159, 27)',  # 実際に検出された緑色（勝ち矢印）
+                        # 追加の緑系バリエーション
+                        'rgb(0, 255', 'rgb(0, 128', 'rgb(13, 159', 'rgb(34, 139',
+                        '#0d9f1b', '#22b14c', '#2ecc71', '#27ae60', '#16a085',
+                        'rgba(13, 159', 'rgba(0, 255', 'rgba(0, 128',
+                        '13, 159, 27', '0, 255, 0', '0, 128, 0'  # RGB値のみのパターン
                     ]
                     
                     # 赤系の色（勝ち矢印）
                     red_patterns = [
                         'red', '#ff0000', '#f00', 'rgb(255, 0, 0)', 'rgb(220, 20, 60)',
-                        'rgb(255,', '#dc143c', '#b22222', '#8b0000'
+                        'rgb(255,', '#dc143c', '#b22222', '#8b0000',
+                        # 追加の赤系バリエーション
+                        'rgb(255, 0', 'rgb(220, 20', 'rgb(178, 34',
+                        '#e74c3c', '#c0392b', '#e67e22', '#d35400',
+                        'rgba(255, 0', 'rgba(220, 20',
+                        '255, 0, 0', '220, 20, 60'  # RGB値のみのパターン
                     ]
                     
                     # 白い背景の矢印（矢印の背景部分）
@@ -1332,18 +1306,24 @@ def scrape_chart_arrows(page):
                     # 矢印らしい要素の判定
                     is_arrow_like = False
                     
-                    # 色による判定（TheOptionの実際の表示に基づく）
-                    # 現在表示されている状況から判断すると、検出された矢印は全て負けの可能性が高い
+                    # 色による判定（勝ち判定を優先、黒・グレーのみ負け判定）
+                    matched_patterns = []  # マッチした色パターンを記録
                     
-                    if any(pattern in all_colors for pattern in gray_patterns):
-                        result = 'loss'
-                        is_arrow_like = True
-                    elif any(pattern in all_colors for pattern in green_win_patterns):
+                    # 優先順位1: 緑色（勝ち矢印）を先にチェック
+                    if any(pattern in all_colors for pattern in green_win_patterns):
                         result = 'win'  
                         is_arrow_like = True
+                        matched_patterns = [p for p in green_win_patterns if p in all_colors]
+                    # 優先順位2: 赤色（勝ち矢印）
                     elif any(pattern in all_colors for pattern in red_patterns):
                         result = 'win'  
                         is_arrow_like = True
+                        matched_patterns = [p for p in red_patterns if p in all_colors]
+                    # 優先順位3: 黒・グレー（負け矢印）
+                    elif any(pattern in all_colors for pattern in loss_patterns):
+                        result = 'loss'
+                        is_arrow_like = True
+                        matched_patterns = [p for p in loss_patterns if p in all_colors]
                     elif any(pattern in all_colors for pattern in blue_patterns):
                         result = 'unknown'  # 青は特殊マーカー、矢印ではない可能性
                         is_arrow_like = False  # 青いマーカーは除外
@@ -1358,17 +1338,11 @@ def scrape_chart_arrows(page):
                     
                     # 緊急モード: 全ての検出された矢印を負けとして扱う
                     if EMERGENCY_MODE:
-                        # 円形要素または小さなpath要素であれば矢印として認識
-                        if (el['tagName'].lower() in ['circle', 'path'] and 
-                            5 <= el['width'] <= 20 and 5 <= el['height'] <= 20 and
+                        # 三角矢印の可能性がある要素（path, polygon, circle）
+                        if (el['tagName'].lower() in ['circle', 'path', 'polygon'] and 
+                            3 <= el['width'] <= 25 and 3 <= el['height'] <= 25 and
                             not any(pattern in all_colors for pattern in blue_patterns)):
                             result = 'loss'  # 緊急モードでは全て負け
-                            is_arrow_like = True
-                    else:
-                        # 通常モードの判定
-                        # 特別な処理: 現在の状況では rgb(13, 159, 27) を負けとして扱う
-                        if 'rgb(13, 159, 27)' in all_colors:
-                            result = 'loss'  # 現在の表示状況から負けと判定
                             is_arrow_like = True
                     
                     # 特定の形状やクラス名で矢印を判定
@@ -1411,7 +1385,8 @@ def scrape_chart_arrows(page):
                             'height': el['height'],
                             'colors': all_colors,
                             'tagName': el['tagName'],
-                            'element': el
+                            'element': el,
+                            'matched_patterns': matched_patterns  # マッチした色パターンを記録
                         })
             
             # 重複要素を除外（同じ位置にあるpath要素とcircle要素）
@@ -1435,30 +1410,6 @@ def scrape_chart_arrows(page):
             
             potential_arrows = unique_arrows
             
-            print(f"\n[🎯 ARROW CANDIDATES] 矢印候補の詳細 (重複除去後):")
-            for idx, arrow in enumerate(potential_arrows):
-                print(f"  Arrow #{idx+1}: {arrow['result']} at ({arrow['x']:.0f},{arrow['y']:.0f}) size={arrow['width']:.0f}x{arrow['height']:.0f}")
-                print(f"    Tag: {arrow['tagName']}, Colors: {arrow['colors']}")
-                print(f"    Classes: {arrow['element']['classes']}")
-            
-            # 実際の矢印が見つからない場合の詳細解析
-            if len(potential_arrows) < 5:
-                print(f"\n[🔍 DETAILED SEARCH] 矢印候補が少ないため詳細解析を実行...")
-                
-                # チャート領域内の全ての小要素を表示
-                chart_small_elements = [el for el in page_analysis['allElements'] 
-                                      if 50 <= el['x'] <= 800 and 200 <= el['y'] <= 650  # チャート領域
-                                      and 5 <= el['width'] <= 30 and 5 <= el['height'] <= 30]  # 小要素
-                
-                print(f"[📊 CHART SMALL] チャート内小要素: {len(chart_small_elements)}個")
-                for idx, el in enumerate(chart_small_elements[:10]):  # 最初の10個
-                    fill = str(el.get('fill', ''))
-                    stroke = str(el.get('stroke', ''))
-                    colors = f"fill:{fill}, stroke:{stroke}"
-                    print(f"  #{idx+1}: {el['tagName']} {el['width']:.0f}x{el['height']:.0f} at ({el['x']:.0f},{el['y']:.0f})")
-                    print(f"    {colors}")
-                    print(f"    Classes: {el['classes']}")
-            
             # X座標でソート（右から左へ）
             potential_arrows.sort(key=lambda x: x['x'], reverse=True)
             
@@ -1466,63 +1417,37 @@ def scrape_chart_arrows(page):
             definite_arrows = [arrow for arrow in potential_arrows if arrow['result'] in ['win', 'loss']]
             recent_arrows = definite_arrows[:10]
             
-            print(f"\n[🏆 FINAL ARROWS] 最新10個の確定矢印:")
+            print(f"\n[🏆 FINAL ARROWS] 検出された確定矢印: {len(recent_arrows)}個")
             
             arrow_results = []
             for idx, arrow in enumerate(recent_arrows):
                 arrow_results.append(arrow['result'])
-                status_emoji = "💀" if arrow['result'] == 'loss' else "✅" if arrow['result'] == 'win' else "❓"
-                print(f"  {status_emoji} #{idx+1}: {arrow['result']} at ({arrow['x']:.0f},{arrow['y']:.0f})")
+                status_emoji = "💀" if arrow['result'] == 'loss' else "✅"
+                print(f"  {status_emoji} #{idx+1}: {arrow['result']}")
             
-            print(f"\n[📊 FINAL RESULT] 検出された確定矢印: {len(arrow_results)}個")
-            if EMERGENCY_MODE:
-                print(f"[🚨 EMERGENCY MODE] 全ての矢印を負けとして判定中")
+            print(f"\n[📊 RESULT] 確定矢印: {len(arrow_results)}個")
                 
-            if len(arrow_results) >= 10:
+            if len(arrow_results) >= RECENT_CHECK_COUNT:
                 loss_count = arrow_results.count('loss')
                 win_count = arrow_results.count('win')
-                print(f"[📊 ANALYSIS] 勝ち: {win_count}個, 負け: {loss_count}個 / 10個")
-                if loss_count >= RECENT_LOSS_THRESHOLD:
-                    print(f"[🚫 BLOCK] {loss_count}個の負け ≥ {RECENT_LOSS_THRESHOLD}個 → ブロック発動")
-                else:
-                    print(f"[🟢 OK] {loss_count}個の負け < {RECENT_LOSS_THRESHOLD}個 → 取引継続")
+                print(f"  勝ち: {win_count}個, 負け: {loss_count}個")
+            elif len(arrow_results) >= MIN_CHECK_COUNT:
+                loss_count = arrow_results.count('loss')
+                win_count = arrow_results.count('win')
+                print(f"  勝ち: {win_count}個, 負け: {loss_count}個（最低モード）")
             else:
-                print(f"[⚠️ INSUFFICIENT] 確定矢印が{len(arrow_results)}個のみ（10個必要）")
-                print(f"[📋 FALLBACK] 手動記録システムを使用してください")
-                # 矢印が少ない場合は空のリストを返す（ブロックしない）
+                print(f"  ⚠️ データ不足（最低{MIN_CHECK_COUNT}個必要）")
                 return []
             
             return arrow_results
-            
-            print(f"\n[🎯 POTENTIAL ARROWS] 矢印候補: {len(potential_arrows)}個")
-            for idx, arrow in enumerate(potential_arrows[:15]):
-                el = arrow['element']
-                status_emoji = "❌" if arrow['result'] == 'loss' else "✅"
-                print(f"  [{status_emoji} #{idx+1}] {arrow['result']} at ({arrow['x']:.0f},{arrow['y']:.0f})")
-                print(f"    {el['tagName']} - Classes: {el['classes']}")
-                print(f"    Fill: {el['fill']}, Stroke: {el['stroke']}, BgColor: {el['backgroundColor']}")
-            
-            # 結果リストを作成
-            results = [arrow['result'] for arrow in potential_arrows]
-            
+        
         except Exception as js_error:
             print(f"[ERROR] JavaScript解析エラー: {js_error}")
-            import traceback
-            print(traceback.format_exc())
-        
-        print(f"\n[📊 FINAL RESULT] 検出された矢印: {len(results)}個")
-        if len(results) >= RECENT_CHECK_COUNT:
-            recent_10 = results[:RECENT_CHECK_COUNT]
-            loss_count = sum(1 for r in recent_10 if r == 'loss')
-            print(f"[📈 SUMMARY] 直近{RECENT_CHECK_COUNT}個: 勝ち{RECENT_CHECK_COUNT-loss_count}個, 負け{loss_count}個")
-        else:
-            print(f"[⚠️ INSUFFICIENT] 矢印が{len(results)}個のみ（{RECENT_CHECK_COUNT}個必要）")
-        
-        return results
+            return []
         
     except Exception as e:
         print(f"[❌ CHART ERROR] チャート矢印解析エラー: {e}")
-        import traceback
+        return []
         print(traceback.format_exc())
         return []
 
@@ -1652,34 +1577,83 @@ def add_loss_to_history(loss_history, action_str, entry_price, entry_time=None):
 def evaluate_chart_arrows_and_pause(page):
     """
     チャート矢印を解析して必要に応じてトレードを一時停止
+    Webサイト上の矢印をスクレイピングして、新しいものをrecent_trade_outcomesに追加
+    評価はrecent_trade_outcomes dequeの中身のみを使用（Webサイトの総数は無視）
     Args:
         page: Playwrightのページオブジェクト
     Returns: (paused_until_datetime or None, triggered_bool)
     """
+    global trading_paused_until, recent_trade_outcomes, last_arrow_count
+    
     try:
-        # チャート矢印を解析
-        arrow_results = scrape_chart_arrows(page)
+        # 既に停止中の場合は評価をスキップ
+        current_time = datetime.now()
+        if trading_paused_until and current_time < trading_paused_until:
+            remaining = int((trading_paused_until - current_time).total_seconds())
+            print(f"[⏸️ ALREADY PAUSED] 既に停止中のため評価をスキップ (残り{remaining}秒)")
+            return trading_paused_until, False
         
-        if len(arrow_results) >= RECENT_CHECK_COUNT:
-            # 直近10個を評価
-            recent_10 = arrow_results[:RECENT_CHECK_COUNT]
-            loss_count = sum(1 for r in recent_10 if r == 'loss')
+        # チャート矢印を解析（Webサイト上の全矢印を取得）
+        arrow_results = scrape_chart_arrows(page)
+        current_arrow_count = len(arrow_results)
+        
+        # 新しい矢印が追加されたかチェック（個数が増えた場合のみ）
+        if current_arrow_count > last_arrow_count and arrow_results:
+            # 最新の矢印（リストの先頭）を追加
+            latest_arrow = arrow_results[0]
+            recent_trade_outcomes.append(latest_arrow)
+            print(f"[📝 RECORD] 新しい矢印を記録: {latest_arrow} (Web上: {current_arrow_count}個 → deque履歴: {len(recent_trade_outcomes)}個)")
+            last_arrow_count = current_arrow_count
+        elif current_arrow_count < last_arrow_count:
+            # 矢印が減った場合（チャートがリセットされた可能性）
+            print(f"[� RESET DETECTED] チャート上の矢印が減少 ({last_arrow_count} → {current_arrow_count})")
+            last_arrow_count = current_arrow_count
+        
+        # recent_trade_outcomes dequeの中身で評価
+        outcomes = list(recent_trade_outcomes)
+        
+        # 矢印数に応じて判定
+        if len(outcomes) >= RECENT_CHECK_COUNT:
+            # 通常モード: 直近5個を評価
+            recent_arrows = outcomes[-RECENT_CHECK_COUNT:]  # dequeの最新5個
+            loss_count = sum(1 for r in recent_arrows if r == 'loss')
             
-            print(f"\n[🎯 ARROW EVAL] 直近{RECENT_CHECK_COUNT}個の矢印評価:")
-            print(f"  - 勝ち（赤・緑）: {RECENT_CHECK_COUNT - loss_count}個")
-            print(f"  - 負け（グレー）: {loss_count}個")
-            print(f"  - 配列: {' '.join(['🔴' if r == 'win' else '⚪' for r in recent_10])}")
+            print(f"\n[🎯 ARROW EVAL] 通常モード - 直近{RECENT_CHECK_COUNT}個の矢印評価:")
+            print(f"  - 勝ち（緑・赤）: {RECENT_CHECK_COUNT - loss_count}個")
+            print(f"  - 負け（グレー・黒）: {loss_count}個")
+            print(f"  - 配列: {' '.join(['🔴' if r == 'win' else '⚪' for r in recent_arrows])}")
             
             if loss_count >= RECENT_LOSS_THRESHOLD:
                 paused_until = datetime.now() + timedelta(seconds=RECENT_BLOCK_SECONDS)
-                print(f"\n[🚫 PAUSE] グレー矢印が{loss_count}個/{RECENT_CHECK_COUNT}個 (>={RECENT_LOSS_THRESHOLD}) => トレードを{RECENT_BLOCK_SECONDS}秒間停止")
+                print(f"\n[🚫 PAUSE] 負け矢印が{loss_count}個/{RECENT_CHECK_COUNT}個 (>={RECENT_LOSS_THRESHOLD}) => トレードを{RECENT_BLOCK_SECONDS}秒間停止")
                 print(f"[⏰ PAUSE] 停止終了予定: {paused_until.strftime('%H:%M:%S')}")
+                print(f"[ℹ️ INFO] {RECENT_BLOCK_SECONDS}秒後の再開時に、新しいチャートデータから判定を開始します")
                 return paused_until, True
             else:
-                print(f"[✅ CONTINUE] グレー矢印が{loss_count}個/{RECENT_CHECK_COUNT}個 (<{RECENT_LOSS_THRESHOLD}) => 取引継続可能")
+                print(f"[✅ CONTINUE] 負け矢印が{loss_count}個/{RECENT_CHECK_COUNT}個 (<{RECENT_LOSS_THRESHOLD}) => 取引継続可能")
+                return None, False
+                
+        elif len(outcomes) >= MIN_CHECK_COUNT:
+            # 最低モード: 3件以上取得時の6割基準
+            recent_arrows = outcomes[-MIN_CHECK_COUNT:]  # dequeの最新3個
+            loss_count = sum(1 for r in recent_arrows if r == 'loss')
+            
+            print(f"\n[🎯 ARROW EVAL] 最低モード - 直近{MIN_CHECK_COUNT}個の矢印評価:")
+            print(f"  - 勝ち（緑・赤）: {MIN_CHECK_COUNT - loss_count}個")
+            print(f"  - 負け（グレー・黒）: {loss_count}個")
+            print(f"  - 配列: {' '.join(['🔴' if r == 'win' else '⚪' for r in recent_arrows])}")
+            
+            if loss_count >= MIN_LOSS_THRESHOLD:
+                paused_until = datetime.now() + timedelta(seconds=RECENT_BLOCK_SECONDS)
+                print(f"\n[🚫 PAUSE] 負け矢印が{loss_count}個/{MIN_CHECK_COUNT}個 (>={MIN_LOSS_THRESHOLD}, 6割超) => トレードを{RECENT_BLOCK_SECONDS}秒間停止")
+                print(f"[⏰ PAUSE] 停止終了予定: {paused_until.strftime('%H:%M:%S')}")
+                print(f"[ℹ️ INFO] {RECENT_BLOCK_SECONDS}秒後の再開時に、新しいチャートデータから判定を開始します")
+                return paused_until, True
+            else:
+                print(f"[✅ CONTINUE] 負け矢印が{loss_count}個/{MIN_CHECK_COUNT}個 (<{MIN_LOSS_THRESHOLD}) => 取引継続可能")
                 return None, False
         else:
-            print(f"[⚠️ INSUFFICIENT] 矢印データ不足: {len(arrow_results)}個/{RECENT_CHECK_COUNT}個必要")
+            print(f"[⚠️ INSUFFICIENT] 矢印データ不足: {len(outcomes)}個（最低{MIN_CHECK_COUNT}個必要）")
             return None, False
             
     except Exception as e:
@@ -1943,14 +1917,16 @@ with sync_playwright() as p:
     print(f"  - ブロック時間: {ENTRY_BLOCK_DURATION_SECONDS}秒（{ENTRY_BLOCK_DURATION_SECONDS//60}分）")
     print(f"  - 履歴参照期間: {LOSS_LOOKBACK_MINUTES}分")
     print(f"【新・チャート矢印フィルター】🎯")
-    print(f"  - 右から矢印{RECENT_CHECK_COUNT}個をチェック")
-    print(f"  - グレー矢印が{RECENT_LOSS_THRESHOLD}個以上でブロック")
+    print(f"  - 通常モード: 右から矢印{RECENT_CHECK_COUNT}個をチェック")
+    print(f"  - 通常基準: 負け矢印が{RECENT_LOSS_THRESHOLD}個以上でブロック（4割基準）")
+    print(f"  - 最低モード: 右から矢印{MIN_CHECK_COUNT}個をチェック")
+    print(f"  - 最低基準: 負け矢印が{MIN_LOSS_THRESHOLD}個以上でブロック（6割超基準）")
     print(f"  - ブロック時間: {RECENT_BLOCK_SECONDS}秒（{RECENT_BLOCK_SECONDS//60}分）")
     print(f"  - 自動解析: 10秒ごとにチャート確認")
     print("")
     print("🎯 直近矢印フィルター設定:")
-    print(f"  - 確認する矢印数: {RECENT_CHECK_COUNT}回")
-    print(f"  - 負け閾値: {RECENT_LOSS_THRESHOLD}回以上")
+    print(f"  - 通常確認数: {RECENT_CHECK_COUNT}回（負け{RECENT_LOSS_THRESHOLD}回以上でブロック）")
+    print(f"  - 最低確認数: {MIN_CHECK_COUNT}回（負け{MIN_LOSS_THRESHOLD}回以上でブロック）")
     print(f"  - ブロック時間: {RECENT_BLOCK_SECONDS}秒（{RECENT_BLOCK_SECONDS//60}分）")
     print("")
     print("※取引結果は60秒後に自動確認を試みますが、")
@@ -2094,16 +2070,38 @@ with sync_playwright() as p:
                 continue
 
             # チャート矢印を定期的にチェック（10秒ごと）
+            # ただし、既に停止中の場合は新しい評価をスキップ
             if current_time.second % 10 < TICK_INTERVAL_SECONDS:
                 try:
-                    paused_until, triggered = evaluate_chart_arrows_and_pause(page)
-                    if triggered:
-                        trading_paused_until = paused_until
-                        print(f"[🚫 CHART BLOCK] チャート矢印によりトレード一時停止")
-                    elif trading_paused_until and current_time >= trading_paused_until:
-                        # 一時停止期間が終了した場合
-                        print(f"[✅ CHART UNBLOCK] チャート矢印ブロック解除")
-                        trading_paused_until = None
+                    # 重複実行を防ぐため、最後の解析から5秒以上経過している場合のみ実行
+                    if (last_chart_analysis_time is None or 
+                        (current_time - last_chart_analysis_time).total_seconds() >= 5):
+                        
+                        if trading_paused_until and current_time < trading_paused_until:
+                            # 既に停止中の場合は再評価をスキップ
+                            remaining = int((trading_paused_until - current_time).total_seconds())
+                            print(f"[⏸️ SKIP] チャート矢印停止中のため評価スキップ (残り{remaining}秒)")
+                        else:
+                            # 停止中でない場合のみ評価を実行
+                            last_chart_analysis_time = current_time
+                            paused_until, triggered = evaluate_chart_arrows_and_pause(page)
+                            if triggered:
+                                trading_paused_until = paused_until
+                                print(f"[🚫 CHART BLOCK] チャート矢印によりトレード一時停止")
+                            elif trading_paused_until and current_time >= trading_paused_until:
+                                # 一時停止期間が終了した場合
+                                print(f"[✅ CHART UNBLOCK] チャート矢印ブロック解除")
+                                trading_paused_until = None
+                                # 再開時に過去の履歴をクリアして、新しいデータのみを使用
+                                recent_trade_outcomes.clear()
+                                # 現在のWebサイト上の矢印個数を取得して、それをベースラインとする
+                                try:
+                                    current_arrows = scrape_chart_arrows(page)
+                                    last_arrow_count = len(current_arrows)
+                                    print(f"[🔄 RESET] 矢印履歴をクリアしました（再開後の新しいデータから計測、現在Web上: {last_arrow_count}個）")
+                                except:
+                                    last_arrow_count = 0
+                                    print(f"[🔄 RESET] 矢印履歴をクリアしました（再開後の新しいデータから計測）")
                 except Exception as e:
                     print(f"[WARN] チャート矢印評価エラー: {e}")
                     # エラー時は手動記録モードにフォールバック
