@@ -151,21 +151,23 @@ CONSECUTIVE_LOSS_THRESHOLD = 3  # 連続負け回数の閾値
 LOSS_LOOKBACK_MINUTES = 5  # 直近何分間の負け履歴を確認するか
 ENTRY_BLOCK_DURATION_SECONDS = 180  # 連敗時のエントリー停止時間（3分=180秒）
 # Recent-arrow based blocking (右から矢印を見て直近N回中M回負けたらブロック)
-RECENT_CHECK_COUNT = 5            # 右から見て何回分の矢印を見るか（通常モード）
-RECENT_LOSS_THRESHOLD = 2         # そのうち何回以上負けならブロックするか（5件中2件=4割）
-MIN_CHECK_COUNT = 3               # 最低データ取得数
-MIN_LOSS_THRESHOLD = 2            # 最低データでの負け閾値（3件中2件=6割超）
+# 動的カウントシステムの設定
+DYNAMIC_MIN_COUNT = 3             # 最小評価数（再開直後）
+DYNAMIC_MAX_COUNT = 10            # 最大評価数
+LOSS_RATE_THRESHOLD = 0.6         # 負け率の閾値（60%）
 RECENT_BLOCK_SECONDS = 120        # 条件該当時にトレードを停止する秒数（2分）
 CHART_DEBUG_MODE = True           # チャート解析のデバッグモード
 
 # recent outcomes (module-level so helper functions can access)
-recent_trade_outcomes = deque(maxlen=RECENT_CHECK_COUNT)
+recent_trade_outcomes = deque(maxlen=DYNAMIC_MAX_COUNT)  # 最大10個まで保持
 # trading paused until (None or datetime)
 trading_paused_until = None
 # 最後のチャート解析時刻（重複実行防止用）
 last_chart_analysis_time = None
 # チャート上の矢印の総数（新しい矢印検出用）
 last_arrow_count = 0
+# 現在の動的評価数（3から開始、最大10まで増加）
+current_evaluation_count = DYNAMIC_MIN_COUNT
 
 # -----------------------
 # FeatureExtraction（既存ロジック準拠）
@@ -1583,7 +1585,7 @@ def evaluate_chart_arrows_and_pause(page):
         page: Playwrightのページオブジェクト
     Returns: (paused_until_datetime or None, triggered_bool)
     """
-    global trading_paused_until, recent_trade_outcomes, last_arrow_count
+    global trading_paused_until, recent_trade_outcomes, last_arrow_count, current_evaluation_count
     
     try:
         # 既に停止中の場合は評価をスキップ
@@ -1602,7 +1604,12 @@ def evaluate_chart_arrows_and_pause(page):
             # 最新の矢印（リストの先頭）を追加
             latest_arrow = arrow_results[0]
             recent_trade_outcomes.append(latest_arrow)
-            print(f"[📝 RECORD] 新しい矢印を記録: {latest_arrow} (Web上: {current_arrow_count}個 → deque履歴: {len(recent_trade_outcomes)}個)")
+            
+            # 動的評価数を増やす（最大10まで）
+            if current_evaluation_count < DYNAMIC_MAX_COUNT:
+                current_evaluation_count = min(len(recent_trade_outcomes), DYNAMIC_MAX_COUNT)
+            
+            print(f"[📝 RECORD] 新しい矢印を記録: {latest_arrow} (Web上: {current_arrow_count}個 → deque: {len(recent_trade_outcomes)}個, 評価数: {current_evaluation_count})")
             last_arrow_count = current_arrow_count
         elif current_arrow_count < last_arrow_count:
             # 矢印が減った場合（チャートがリセットされた可能性）
@@ -1612,48 +1619,32 @@ def evaluate_chart_arrows_and_pause(page):
         # recent_trade_outcomes dequeの中身で評価
         outcomes = list(recent_trade_outcomes)
         
-        # 矢印数に応じて判定
-        if len(outcomes) >= RECENT_CHECK_COUNT:
-            # 通常モード: 直近5個を評価
-            recent_arrows = outcomes[-RECENT_CHECK_COUNT:]  # dequeの最新5個
+        # 動的評価: 現在の評価数に応じて判定
+        if len(outcomes) >= current_evaluation_count:
+            # 右から（最新から）current_evaluation_count個を評価
+            recent_arrows = outcomes[-current_evaluation_count:]
             loss_count = sum(1 for r in recent_arrows if r == 'loss')
+            win_count = current_evaluation_count - loss_count
+            loss_rate = loss_count / current_evaluation_count
             
-            print(f"\n[🎯 ARROW EVAL] 通常モード - 直近{RECENT_CHECK_COUNT}個の矢印評価:")
-            print(f"  - 勝ち（緑・赤）: {RECENT_CHECK_COUNT - loss_count}個")
+            print(f"\n[🎯 ARROW EVAL] 動的評価 - 直近{current_evaluation_count}個:")
+            print(f"  - 勝ち（緑・赤）: {win_count}個")
             print(f"  - 負け（グレー・黒）: {loss_count}個")
+            print(f"  - 負け率: {loss_rate*100:.1f}%")
             print(f"  - 配列: {' '.join(['🔴' if r == 'win' else '⚪' for r in recent_arrows])}")
             
-            if loss_count >= RECENT_LOSS_THRESHOLD:
+            # 6割以上負けている場合は停止
+            if loss_rate >= LOSS_RATE_THRESHOLD:
                 paused_until = datetime.now() + timedelta(seconds=RECENT_BLOCK_SECONDS)
-                print(f"\n[🚫 PAUSE] 負け矢印が{loss_count}個/{RECENT_CHECK_COUNT}個 (>={RECENT_LOSS_THRESHOLD}) => トレードを{RECENT_BLOCK_SECONDS}秒間停止")
+                print(f"\n[🚫 PAUSE] 負け率{loss_rate*100:.1f}% (>={LOSS_RATE_THRESHOLD*100:.0f}%) => トレードを{RECENT_BLOCK_SECONDS}秒間停止")
                 print(f"[⏰ PAUSE] 停止終了予定: {paused_until.strftime('%H:%M:%S')}")
-                print(f"[ℹ️ INFO] {RECENT_BLOCK_SECONDS}秒後の再開時に、新しいチャートデータから判定を開始します")
+                print(f"[ℹ️ INFO] {RECENT_BLOCK_SECONDS}秒後の再開時に、評価数を{DYNAMIC_MIN_COUNT}にリセットして新しいデータから判定を開始します")
                 return paused_until, True
             else:
-                print(f"[✅ CONTINUE] 負け矢印が{loss_count}個/{RECENT_CHECK_COUNT}個 (<{RECENT_LOSS_THRESHOLD}) => 取引継続可能")
-                return None, False
-                
-        elif len(outcomes) >= MIN_CHECK_COUNT:
-            # 最低モード: 3件以上取得時の6割基準
-            recent_arrows = outcomes[-MIN_CHECK_COUNT:]  # dequeの最新3個
-            loss_count = sum(1 for r in recent_arrows if r == 'loss')
-            
-            print(f"\n[🎯 ARROW EVAL] 最低モード - 直近{MIN_CHECK_COUNT}個の矢印評価:")
-            print(f"  - 勝ち（緑・赤）: {MIN_CHECK_COUNT - loss_count}個")
-            print(f"  - 負け（グレー・黒）: {loss_count}個")
-            print(f"  - 配列: {' '.join(['🔴' if r == 'win' else '⚪' for r in recent_arrows])}")
-            
-            if loss_count >= MIN_LOSS_THRESHOLD:
-                paused_until = datetime.now() + timedelta(seconds=RECENT_BLOCK_SECONDS)
-                print(f"\n[🚫 PAUSE] 負け矢印が{loss_count}個/{MIN_CHECK_COUNT}個 (>={MIN_LOSS_THRESHOLD}, 6割超) => トレードを{RECENT_BLOCK_SECONDS}秒間停止")
-                print(f"[⏰ PAUSE] 停止終了予定: {paused_until.strftime('%H:%M:%S')}")
-                print(f"[ℹ️ INFO] {RECENT_BLOCK_SECONDS}秒後の再開時に、新しいチャートデータから判定を開始します")
-                return paused_until, True
-            else:
-                print(f"[✅ CONTINUE] 負け矢印が{loss_count}個/{MIN_CHECK_COUNT}個 (<{MIN_LOSS_THRESHOLD}) => 取引継続可能")
+                print(f"[✅ CONTINUE] 負け率{loss_rate*100:.1f}% (<{LOSS_RATE_THRESHOLD*100:.0f}%) => 取引継続可能")
                 return None, False
         else:
-            print(f"[⚠️ INSUFFICIENT] 矢印データ不足: {len(outcomes)}個（最低{MIN_CHECK_COUNT}個必要）")
+            print(f"[⚠️ INSUFFICIENT] 矢印データ不足: {len(outcomes)}個（評価には{current_evaluation_count}個必要）")
             return None, False
             
     except Exception as e:
@@ -2047,7 +2038,33 @@ with sync_playwright() as p:
                     else:
                         q_values = np.pad(qv.astype(float), (0,3-qv.shape[0]), 'constant')
                     
-                    action_idx = int(np.argmax(q_values))
+                    # Q値のバランス調整: High/Lowが近い場合はソフトマックスで確率的に選択
+                    high_q = q_values[1]
+                    low_q = q_values[2]
+                    hold_q = q_values[0]
+                    
+                    # Hold以外のQ値が十分に高い場合
+                    if max(high_q, low_q) > hold_q:
+                        # High/Lowの差が小さい（10%以内）場合、ソフトマックスで確率的選択
+                        q_diff_ratio = abs(high_q - low_q) / max(abs(high_q), abs(low_q), 1e-8)
+                        
+                        if q_diff_ratio < 0.10:  # 10%以内の差
+                            # ソフトマックスで確率的に選択（温度パラメータで調整）
+                            temperature = 0.5  # 低い温度でシャープな分布
+                            action_q_values = q_values / temperature
+                            exp_q = np.exp(action_q_values - np.max(action_q_values))  # 数値安定性
+                            probs = exp_q / np.sum(exp_q)
+                            
+                            # 確率的に選択
+                            action_idx = np.random.choice([0, 1, 2], p=probs)
+                            print(f"[SOFTMAX] Q値が近接 → 確率的選択 (Hold:{probs[0]:.3f}, High:{probs[1]:.3f}, Low:{probs[2]:.3f})")
+                        else:
+                            # 通常の最大値選択
+                            action_idx = int(np.argmax(q_values))
+                    else:
+                        # Holdが最大の場合は素直にHold
+                        action_idx = 0
+                    
                     # map idx -> action: 0=Hold,1=High,2=Low
                     action_map = {0:"Hold", 1:"High", 2:"Low"}
                     action_str = action_map.get(action_idx, "Hold")
@@ -2055,6 +2072,8 @@ with sync_playwright() as p:
                     # Q値の詳細をログ出力（デバッグ用）
                     print(f"[Q-VALUES] Hold:{q_values[0]:.4f}, High:{q_values[1]:.4f}, Low:{q_values[2]:.4f}")
                     print(f"[ACTION] 選択されたアクション: {action_str} (idx:{action_idx})")
+
+
                     
                 except Exception as e:
                     print(f"[WARN] モデル推論失敗: {e}")
@@ -2094,14 +2113,16 @@ with sync_playwright() as p:
                                 trading_paused_until = None
                                 # 再開時に過去の履歴をクリアして、新しいデータのみを使用
                                 recent_trade_outcomes.clear()
+                                # 評価数を3にリセット
+                                current_evaluation_count = DYNAMIC_MIN_COUNT
                                 # 現在のWebサイト上の矢印個数を取得して、それをベースラインとする
                                 try:
                                     current_arrows = scrape_chart_arrows(page)
                                     last_arrow_count = len(current_arrows)
-                                    print(f"[🔄 RESET] 矢印履歴をクリアしました（再開後の新しいデータから計測、現在Web上: {last_arrow_count}個）")
+                                    print(f"[🔄 RESET] 矢印履歴をクリアしました（評価数: {current_evaluation_count}から再開、現在Web上: {last_arrow_count}個）")
                                 except:
                                     last_arrow_count = 0
-                                    print(f"[🔄 RESET] 矢印履歴をクリアしました（再開後の新しいデータから計測）")
+                                    print(f"[🔄 RESET] 矢印履歴をクリアしました（評価数: {current_evaluation_count}から再開）")
                 except Exception as e:
                     print(f"[WARN] チャート矢印評価エラー: {e}")
                     # エラー時は手動記録モードにフォールバック

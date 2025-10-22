@@ -49,7 +49,7 @@ import torch.nn.functional as F
 from concurrent.futures import ThreadPoolExecutor
 import multiprocessing as mp
 
-pair = "EURUSD"
+pair = "USDJPY"
 def _CalcSMAR(df,periods):
     sma_features = {}
     with warnings.catch_warnings():
@@ -557,6 +557,31 @@ class QNet(nn.Module):
             nn.Linear(64, 1),
             nn.Sigmoid()
         )
+        
+        # 重みの初期化（High/Lowの対称性を保証）
+        self._initialize_weights()
+    
+    def _initialize_weights(self):
+        """重みを対称的に初期化してHigh/Lowのバイアスを除去"""
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                # Xavierの均等初期化（対称性保証）
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    # バイアスは小さな値で初期化
+                    nn.init.constant_(m.bias, 0.0)
+            elif isinstance(m, nn.BatchNorm1d):
+                nn.init.constant_(m.weight, 1.0)
+                nn.init.constant_(m.bias, 0.0)
+        
+        # advantage streamの最終層は特別に初期化（Q値の対称性を保証）
+        if hasattr(self, 'advantage_stream'):
+            for layer in self.advantage_stream:
+                if isinstance(layer, nn.Linear):
+                    # より小さな初期値で対称性を強化
+                    nn.init.xavier_uniform_(layer.weight, gain=0.01)
+                    if layer.bias is not None:
+                        nn.init.constant_(layer.bias, 0.0)
     
     def forward(self, x): 
         # 高速化のため処理を簡素化
@@ -993,7 +1018,18 @@ def train_dqn(ohlc_df, pair=pair, save_dir="./Models",
             
             # バッチ推論で高速化
             if random.random() < eps:
-                batch_actions = np.random.randint(0, ACTIONS, len(batch_idxs))
+                # ランダム探索時にHigh/Lowのバランスを強制的に取る
+                batch_actions = []
+                for _ in range(len(batch_idxs)):
+                    # Hold:30%, High:35%, Low:35%の確率分布
+                    rand_val = random.random()
+                    if rand_val < 0.30:
+                        batch_actions.append(0)  # Hold
+                    elif rand_val < 0.65:
+                        batch_actions.append(1)  # High
+                    else:
+                        batch_actions.append(2)  # Low
+                batch_actions = np.array(batch_actions)
             else:
                 q.eval()
                 with torch.no_grad():
@@ -1113,6 +1149,15 @@ def train_dqn(ohlc_df, pair=pair, save_dir="./Models",
                 hold_pct = entry_stats['Hold'] / total_entries * 100
                 high_pct = entry_stats['High'] / total_entries * 100
                 low_pct = entry_stats['Low'] / total_entries * 100
+                
+                # High/Lowバランスの監視と警告
+                if high_pct > 0 or low_pct > 0:
+                    hl_total = entry_stats['High'] + entry_stats['Low']
+                    if hl_total > 0:
+                        high_ratio = entry_stats['High'] / hl_total
+                        low_ratio = entry_stats['Low'] / hl_total
+                        if high_ratio > 0.7 or low_ratio > 0.7:
+                            print(f"[⚠️ IMBALANCE] High/Low比率に偏り - High:{high_ratio*100:.1f}%, Low:{low_ratio*100:.1f}%")
             else:
                 hold_pct = high_pct = low_pct = 0
             
