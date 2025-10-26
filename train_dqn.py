@@ -802,8 +802,13 @@ def train_dqn(ohlc_df, pair=pair, save_dir="./Models",
         print(f"[INFO] Data too large ({len(ohlc_df)} rows), using last {max_data_points} rows")
         ohlc_df = ohlc_df.iloc[-max_data_points:].copy()
     
+    # DatetimeIndexの確認（なければ作成）
     if not isinstance(ohlc_df.index, pd.DatetimeIndex):
-        raise ValueError("DatetimeIndex が必要です")
+        print("[WARN] No DatetimeIndex found. Creating synthetic datetime index...")
+        from datetime import datetime
+        start_time = datetime(2020, 1, 1, 0, 0, 0)
+        ohlc_df.index = pd.date_range(start=start_time, periods=len(ohlc_df), freq='1min')
+        print(f"[INFO] Created DatetimeIndex from {start_time}")
 
     # 入力次元を確定（超多くの履歴を使用）
     window_size = 75  # 80%勝率確実達成のためウィンドウサイズを超拡大
@@ -1339,19 +1344,47 @@ if __name__ == "__main__":
     try:
         print(f"[INFO] Loading data from {data_file}...")
         
-        # より高速なデータ読み込み（データ型事前指定）
-        column_names = ['date', 'time', 'open', 'high', 'low', 'close', 'volume']
-        df = pd.read_csv(data_file, names=column_names,
-                        dtype={'open': np.float32, 'high': np.float32, 
-                               'low': np.float32, 'close': np.float32,
-                               'volume': np.float32})
+        # まずデータを読み込んでカラム数を確認
+        df_test = pd.read_csv(data_file, nrows=5)
+        num_columns = len(df_test.columns)
         
-        # 日付と時刻を結合してDatetimeIndexを作成
-        df['datetime'] = pd.to_datetime(df['date'] + ' ' + df['time'], format='%Y.%m.%d %H:%M')
-        df = df.set_index('datetime')
+        print(f"[INFO] Detected {num_columns} columns in the data file")
         
-        # 不要な列を削除
-        df = df[['open', 'high', 'low', 'close', 'volume']]
+        # カラム数に応じて処理を分岐
+        if num_columns >= 7:
+            # 日時カラムあり（date, time, open, high, low, close, volume）
+            print("[INFO] Data format: with date/time columns")
+            column_names = ['date', 'time', 'open', 'high', 'low', 'close', 'volume']
+            df = pd.read_csv(data_file, names=column_names,
+                            dtype={'open': np.float32, 'high': np.float32, 
+                                   'low': np.float32, 'close': np.float32,
+                                   'volume': np.float32})
+            
+            # 日付と時刻を結合してDatetimeIndexを作成
+            df['datetime'] = pd.to_datetime(df['date'] + ' ' + df['time'], format='%Y.%m.%d %H:%M')
+            df = df.set_index('datetime')
+            
+            # 不要な列を削除
+            df = df[['open', 'high', 'low', 'close', 'volume']]
+            
+        elif num_columns >= 5:
+            # 日時カラムなし（open, high, low, close, volume）
+            print("[INFO] Data format: OHLCV only (no date/time columns)")
+            column_names = ['open', 'high', 'low', 'close', 'volume']
+            df = pd.read_csv(data_file, names=column_names,
+                            dtype={'open': np.float32, 'high': np.float32, 
+                                   'low': np.float32, 'close': np.float32,
+                                   'volume': np.float32})
+            
+            # 連番インデックスを使用してDatetimeIndexを生成
+            # 1分足と仮定して、開始時刻から1分ずつ進める
+            from datetime import datetime, timedelta
+            start_time = datetime(2020, 1, 1, 0, 0, 0)
+            df.index = pd.date_range(start=start_time, periods=len(df), freq='1min')
+            print(f"[INFO] Created synthetic datetime index starting from {start_time}")
+            
+        else:
+            raise ValueError(f"Unexpected number of columns: {num_columns}. Expected 5 or 7 columns.")
         
         print(f"[INFO] Data loaded: {len(df)} rows")
         print(f"[INFO] Data range: {df.index[0]} to {df.index[-1]}")
@@ -1376,14 +1409,33 @@ if __name__ == "__main__":
         if available_files:
             print(f"\n[INFO] 代替ファイルを使用しますか？最初のファイルを使用: {available_files[0]}")
             
-            column_names = ['date', 'time', 'open', 'high', 'low', 'close', 'volume']
-            df = pd.read_csv(available_files[0], names=column_names,
-                           dtype={'open': np.float32, 'high': np.float32, 
-                                  'low': np.float32, 'close': np.float32,
-                                  'volume': np.float32})
-            df['datetime'] = pd.to_datetime(df['date'] + ' ' + df['time'], format='%Y.%m.%d %H:%M')
-            df = df.set_index('datetime')
-            df = df[['open', 'high', 'low', 'close', 'volume']]
+            # まずカラム数を確認
+            df_test = pd.read_csv(available_files[0], nrows=5)
+            num_columns = len(df_test.columns)
+            
+            if num_columns >= 7:
+                # 日時カラムあり
+                column_names = ['date', 'time', 'open', 'high', 'low', 'close', 'volume']
+                df = pd.read_csv(available_files[0], names=column_names,
+                               dtype={'open': np.float32, 'high': np.float32, 
+                                      'low': np.float32, 'close': np.float32,
+                                      'volume': np.float32})
+                df['datetime'] = pd.to_datetime(df['date'] + ' ' + df['time'], format='%Y.%m.%d %H:%M')
+                df = df.set_index('datetime')
+                df = df[['open', 'high', 'low', 'close', 'volume']]
+            elif num_columns >= 5:
+                # 日時カラムなし
+                column_names = ['open', 'high', 'low', 'close', 'volume']
+                df = pd.read_csv(available_files[0], names=column_names,
+                               dtype={'open': np.float32, 'high': np.float32, 
+                                      'low': np.float32, 'close': np.float32,
+                                      'volume': np.float32})
+                from datetime import datetime, timedelta
+                start_time = datetime(2020, 1, 1, 0, 0, 0)
+                df.index = pd.date_range(start=start_time, periods=len(df), freq='1min')
+                print(f"[INFO] Created synthetic datetime index")
+            else:
+                raise ValueError(f"Unexpected columns: {num_columns}")
             
             pair_from_file = available_files[0].split('\\')[-1].split('_')[0]  # Windowsパス区切り対応
             print(f"[INFO] ペア名を {pair_from_file} に変更")
