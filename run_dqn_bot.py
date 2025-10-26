@@ -1429,16 +1429,12 @@ def scrape_chart_arrows(page):
             
             print(f"\n[📊 RESULT] 確定矢印: {len(arrow_results)}個")
                 
-            if len(arrow_results) >= RECENT_CHECK_COUNT:
+            if len(arrow_results) >= DYNAMIC_MIN_COUNT:
                 loss_count = arrow_results.count('loss')
                 win_count = arrow_results.count('win')
                 print(f"  勝ち: {win_count}個, 負け: {loss_count}個")
-            elif len(arrow_results) >= MIN_CHECK_COUNT:
-                loss_count = arrow_results.count('loss')
-                win_count = arrow_results.count('win')
-                print(f"  勝ち: {win_count}個, 負け: {loss_count}個（最低モード）")
             else:
-                print(f"  ⚠️ データ不足（最低{MIN_CHECK_COUNT}個必要）")
+                print(f"  ⚠️ データ不足（最低{DYNAMIC_MIN_COUNT}個必要）")
                 return []
             
             return arrow_results
@@ -1588,12 +1584,12 @@ def evaluate_chart_arrows_and_pause(page):
     global trading_paused_until, recent_trade_outcomes, last_arrow_count, current_evaluation_count
     
     try:
-        # 既に停止中の場合は評価をスキップ
         current_time = datetime.now()
-        if trading_paused_until and current_time < trading_paused_until:
+        is_currently_paused = trading_paused_until and current_time < trading_paused_until
+        
+        if is_currently_paused:
             remaining = int((trading_paused_until - current_time).total_seconds())
-            print(f"[⏸️ ALREADY PAUSED] 既に停止中のため評価をスキップ (残り{remaining}秒)")
-            return trading_paused_until, False
+            print(f"[⏸️ PAUSED] 停止中 (残り{remaining}秒) - 解除条件を確認します...")
         
         # チャート矢印を解析（Webサイト上の全矢印を取得）
         arrow_results = scrape_chart_arrows(page)
@@ -1633,16 +1629,32 @@ def evaluate_chart_arrows_and_pause(page):
             print(f"  - 負け率: {loss_rate*100:.1f}%")
             print(f"  - 配列: {' '.join(['🔴' if r == 'win' else '⚪' for r in recent_arrows])}")
             
-            # 6割以上負けている場合は停止
+            # 6割以上負けている場合は停止（または停止継続）
             if loss_rate >= LOSS_RATE_THRESHOLD:
-                paused_until = datetime.now() + timedelta(seconds=RECENT_BLOCK_SECONDS)
-                print(f"\n[🚫 PAUSE] 負け率{loss_rate*100:.1f}% (>={LOSS_RATE_THRESHOLD*100:.0f}%) => トレードを{RECENT_BLOCK_SECONDS}秒間停止")
-                print(f"[⏰ PAUSE] 停止終了予定: {paused_until.strftime('%H:%M:%S')}")
-                print(f"[ℹ️ INFO] {RECENT_BLOCK_SECONDS}秒後の再開時に、評価数を{DYNAMIC_MIN_COUNT}にリセットして新しいデータから判定を開始します")
-                return paused_until, True
+                if is_currently_paused:
+                    # 既に停止中で、まだ条件を満たしている場合
+                    print(f"\n[🚫 PAUSE CONTINUE] 負け率{loss_rate*100:.1f}% (>={LOSS_RATE_THRESHOLD*100:.0f}%) => 停止を継続")
+                    print(f"[⏰ PAUSE] 停止終了予定: {trading_paused_until.strftime('%H:%M:%S')}")
+                    return trading_paused_until, True
+                else:
+                    # 新規に停止する場合
+                    paused_until = datetime.now() + timedelta(seconds=RECENT_BLOCK_SECONDS)
+                    print(f"\n[🚫 PAUSE START] 負け率{loss_rate*100:.1f}% (>={LOSS_RATE_THRESHOLD*100:.0f}%) => トレードを{RECENT_BLOCK_SECONDS}秒間停止")
+                    print(f"[⏰ PAUSE] 停止終了予定: {paused_until.strftime('%H:%M:%S')}")
+                    print(f"[ℹ️ INFO] {RECENT_BLOCK_SECONDS}秒後の再開時に、評価数を{DYNAMIC_MIN_COUNT}にリセットして新しいデータから判定を開始します")
+                    return paused_until, True
             else:
-                print(f"[✅ CONTINUE] 負け率{loss_rate*100:.1f}% (<{LOSS_RATE_THRESHOLD*100:.0f}%) => 取引継続可能")
-                return None, False
+                if is_currently_paused:
+                    # 停止中だったが条件をクリアした場合
+                    print(f"\n[✅ PAUSE CANCELED] 負け率{loss_rate*100:.1f}% (<{LOSS_RATE_THRESHOLD*100:.0f}%) => 停止を解除して取引再開！")
+                    print(f"[ℹ️ INFO] 評価数を{DYNAMIC_MIN_COUNT}にリセットして新しいデータから判定を開始します")
+                    # 評価数をリセット（新しいスタート）
+                    current_evaluation_count = DYNAMIC_MIN_COUNT
+                    return None, False  # 停止解除
+                else:
+                    # 通常状態で条件をクリアしている場合
+                    print(f"[✅ CONTINUE] 負け率{loss_rate*100:.1f}% (<{LOSS_RATE_THRESHOLD*100:.0f}%) => 取引継続可能")
+                    return None, False
         else:
             print(f"[⚠️ INSUFFICIENT] 矢印データ不足: {len(outcomes)}個（評価には{current_evaluation_count}個必要）")
             return None, False
@@ -1658,15 +1670,27 @@ def evaluate_recent_outcomes_and_pause(recent_trade_outcomes, trading_paused_unt
     recent_trade_outcomes: deque of 'win'/'loss' (手動記録用・互換性維持)
     trading_paused_until_ref: a reference (mutable) to update paused-until timestamp (pass by name)
     Returns: (paused_until_datetime or None, triggered_bool)
+    
+    動的評価システム: current_evaluation_countに応じて評価個数を変化させる
     """
+    global current_evaluation_count
+    
     try:
         outcomes = list(recent_trade_outcomes)
-        if len(outcomes) < RECENT_CHECK_COUNT:
+        # 現在の評価数を使用
+        eval_count = min(current_evaluation_count, len(outcomes))
+        
+        if eval_count < DYNAMIC_MIN_COUNT:
             return None, False
-        losses = sum(1 for o in outcomes if o == 'loss')
-        if losses >= RECENT_LOSS_THRESHOLD:
+        
+        # 右から（最新から）eval_count個を評価
+        recent = outcomes[-eval_count:]
+        losses = sum(1 for o in recent if o == 'loss')
+        loss_rate = losses / eval_count
+        
+        if loss_rate >= LOSS_RATE_THRESHOLD:
             paused_until = datetime.now() + timedelta(seconds=RECENT_BLOCK_SECONDS)
-            print(f"[PAUSE] 手動記録: 直近{RECENT_CHECK_COUNT}回で{losses}回の負け => トレードを{RECENT_BLOCK_SECONDS}秒間停止します（{paused_until.strftime('%H:%M:%S')}まで）")
+            print(f"[PAUSE] 手動記録: 直近{eval_count}回で{losses}回の負け（負け率{loss_rate*100:.1f}%） => トレードを{RECENT_BLOCK_SECONDS}秒間停止します（{paused_until.strftime('%H:%M:%S')}まで）")
             return paused_until, True
         return None, False
     except Exception as e:
@@ -1907,17 +1931,17 @@ with sync_playwright() as p:
     print(f"  - 連続負け閾値: {CONSECUTIVE_LOSS_THRESHOLD}回")
     print(f"  - ブロック時間: {ENTRY_BLOCK_DURATION_SECONDS}秒（{ENTRY_BLOCK_DURATION_SECONDS//60}分）")
     print(f"  - 履歴参照期間: {LOSS_LOOKBACK_MINUTES}分")
-    print(f"【新・チャート矢印フィルター】🎯")
-    print(f"  - 通常モード: 右から矢印{RECENT_CHECK_COUNT}個をチェック")
-    print(f"  - 通常基準: 負け矢印が{RECENT_LOSS_THRESHOLD}個以上でブロック（4割基準）")
-    print(f"  - 最低モード: 右から矢印{MIN_CHECK_COUNT}個をチェック")
-    print(f"  - 最低基準: 負け矢印が{MIN_LOSS_THRESHOLD}個以上でブロック（6割超基準）")
+    print(f"【新・動的チャート矢印フィルター】🎯")
+    print(f"  - 動的評価: 右から矢印{DYNAMIC_MIN_COUNT}個（開始時）→ {DYNAMIC_MAX_COUNT}個（最大）")
+    print(f"  - 負け率閾値: {int(LOSS_RATE_THRESHOLD*100)}%以上でブロック")
     print(f"  - ブロック時間: {RECENT_BLOCK_SECONDS}秒（{RECENT_BLOCK_SECONDS//60}分）")
     print(f"  - 自動解析: 10秒ごとにチャート確認")
+    print(f"  - カウントリセット: ブロック終了後は{DYNAMIC_MIN_COUNT}個から再開")
     print("")
-    print("🎯 直近矢印フィルター設定:")
-    print(f"  - 通常確認数: {RECENT_CHECK_COUNT}回（負け{RECENT_LOSS_THRESHOLD}回以上でブロック）")
-    print(f"  - 最低確認数: {MIN_CHECK_COUNT}回（負け{MIN_LOSS_THRESHOLD}回以上でブロック）")
+    print("🎯 動的矢印フィルター設定:")
+    print(f"  - 初期確認数: {DYNAMIC_MIN_COUNT}個（BOT再開直後）")
+    print(f"  - 最大確認数: {DYNAMIC_MAX_COUNT}個（段階的に増加）")
+    print(f"  - 負け率閾値: {int(LOSS_RATE_THRESHOLD*100)}%以上でブロック")
     print(f"  - ブロック時間: {RECENT_BLOCK_SECONDS}秒（{RECENT_BLOCK_SECONDS//60}分）")
     print("")
     print("※取引結果は60秒後に自動確認を試みますが、")
@@ -2088,7 +2112,7 @@ with sync_playwright() as p:
                 time.sleep(TICK_INTERVAL_SECONDS)
                 continue
 
-            # チャート矢印を定期的にチェック（10秒ごと）
+            # チャート矢印を定期的にチェック（10秒ごと、停止中も評価して解除条件をチェック）
             # ただし、既に停止中の場合は新しい評価をスキップ
             if current_time.second % 10 < TICK_INTERVAL_SECONDS:
                 try:
@@ -2096,20 +2120,30 @@ with sync_playwright() as p:
                     if (last_chart_analysis_time is None or 
                         (current_time - last_chart_analysis_time).total_seconds() >= 5):
                         
-                        if trading_paused_until and current_time < trading_paused_until:
-                            # 既に停止中の場合は再評価をスキップ
-                            remaining = int((trading_paused_until - current_time).total_seconds())
-                            print(f"[⏸️ SKIP] チャート矢印停止中のため評価スキップ (残り{remaining}秒)")
-                        else:
-                            # 停止中でない場合のみ評価を実行
-                            last_chart_analysis_time = current_time
-                            paused_until, triggered = evaluate_chart_arrows_and_pause(page)
-                            if triggered:
-                                trading_paused_until = paused_until
-                                print(f"[🚫 CHART BLOCK] チャート矢印によりトレード一時停止")
+                        # 停止中でも評価を実行して解除条件をチェック
+                        last_chart_analysis_time = current_time
+                        paused_until, triggered = evaluate_chart_arrows_and_pause(page)
+                        
+                        # 停止解除された場合（paused_until=None, triggered=False）
+                        if not triggered and paused_until is None:
+                            if trading_paused_until and current_time < trading_paused_until:
+                                # 停止中だったが解除された
+                                print(f"[✅ CHART UNBLOCK] 条件クリアによりブロック解除！")
+                                trading_paused_until = None
+                                # 再開時に過去の履歴をクリアして、新しいデータのみを使用
+                                recent_trade_outcomes.clear()
+                                # 評価数を3にリセット（既に関数内でリセット済み）
+                                # 現在のWebサイト上の矢印個数を取得して、それをベースラインとする
+                                try:
+                                    current_arrows = scrape_chart_arrows(page)
+                                    last_arrow_count = len(current_arrows)
+                                    print(f"[🔄 RESET] 矢印履歴をクリアしました（評価数: {current_evaluation_count}から再開、現在Web上: {last_arrow_count}個）")
+                                except:
+                                    last_arrow_count = 0
+                                    print(f"[� RESET] 矢印履歴をクリアしました（評価数: {current_evaluation_count}から再開）")
                             elif trading_paused_until and current_time >= trading_paused_until:
-                                # 一時停止期間が終了した場合
-                                print(f"[✅ CHART UNBLOCK] チャート矢印ブロック解除")
+                                # タイムアウトで停止期間が終了した場合
+                                print(f"[⏰ TIMEOUT] チャート矢印ブロックの時間切れ")
                                 trading_paused_until = None
                                 # 再開時に過去の履歴をクリアして、新しいデータのみを使用
                                 recent_trade_outcomes.clear()
@@ -2123,6 +2157,15 @@ with sync_playwright() as p:
                                 except:
                                     last_arrow_count = 0
                                     print(f"[🔄 RESET] 矢印履歴をクリアしました（評価数: {current_evaluation_count}から再開）")
+                        
+                        # 新規停止または停止継続の場合
+                        elif triggered:
+                            was_paused = trading_paused_until and current_time < trading_paused_until
+                            trading_paused_until = paused_until
+                            if was_paused:
+                                print(f"[🚫 CHART BLOCK CONTINUE] チャート矢印停止継続中")
+                            else:
+                                print(f"[🚫 CHART BLOCK START] チャート矢印によりトレード一時停止開始")
                 except Exception as e:
                     print(f"[WARN] チャート矢印評価エラー: {e}")
                     # エラー時は手動記録モードにフォールバック
@@ -2286,11 +2329,14 @@ with sync_playwright() as p:
                 else:
                     print(f"  📋 手動負け履歴: なし")
                 
-                # recent arrow status
+                # recent arrow status（動的システム）
                 recent_outcomes = list(recent_trade_outcomes)
-                recent_loss_count = sum(1 for o in recent_outcomes if o == 'loss')
-                print(f"\n[🎯 RECENT ARROWS] 直近{len(recent_outcomes)}/{RECENT_CHECK_COUNT}回の結果")
-                print(f"  - 負け: {recent_loss_count}回 {'🚫ブロック対象' if recent_loss_count >= RECENT_LOSS_THRESHOLD else ''}")
+                eval_count = min(current_evaluation_count, len(recent_outcomes))
+                recent_loss_count = sum(1 for o in recent_outcomes[-eval_count:] if o == 'loss')
+                loss_rate = (recent_loss_count / eval_count * 100) if eval_count > 0 else 0
+                
+                print(f"\n[🎯 DYNAMIC ARROWS] 直近{eval_count}回の結果（現在の評価数: {current_evaluation_count}/{DYNAMIC_MAX_COUNT}）")
+                print(f"  - 負け: {recent_loss_count}回（負け率: {loss_rate:.1f}%） {'🚫ブロック対象' if loss_rate >= LOSS_RATE_THRESHOLD * 100 else ''}")
                 if recent_outcomes:
                     arrows = ''.join(['❌' if o == 'loss' else '✅' for o in recent_outcomes[-10:]])
                     print(f"  - 矢印: {arrows} (右から左へ)")
