@@ -143,31 +143,8 @@ if not os.path.exists(LOG_PATH):
 # DQNの閾値（Holdをスキップする／しきい値）
 DQN_Q_MARGIN = 0.0  # Holdとの差でエントリーを抑制したければ正にする
 
-# トレンドフィルター設定
-TREND_FILTER_ENABLED = True  # トレンドフィルターを有効にする
-TREND_LOOKBACK_PERIODS = 8  # 直近の価格傾き判定期間（短期集中）
-PRICE_SLOPE_THRESHOLD = -0.0001  # 価格傾きの閾値（負の値で下降判定）
-CONSECUTIVE_LOSS_THRESHOLD = 3  # 連続負け回数の閾値
-LOSS_LOOKBACK_MINUTES = 5  # 直近何分間の負け履歴を確認するか
-ENTRY_BLOCK_DURATION_SECONDS = 180  # 連敗時のエントリー停止時間（3分=180秒）
-# Recent-arrow based blocking (右から矢印を見て直近N回中M回負けたらブロック)
-# 動的カウントシステムの設定
-DYNAMIC_MIN_COUNT = 3             # 最小評価数（再開直後）
-DYNAMIC_MAX_COUNT = 10            # 最大評価数
-LOSS_RATE_THRESHOLD = 0.6         # 負け率の閾値（60%）
-RECENT_BLOCK_SECONDS = 120        # 条件該当時にトレードを停止する秒数（2分）
-CHART_DEBUG_MODE = True           # チャート解析のデバッグモード
-
-# recent outcomes (module-level so helper functions can access)
-recent_trade_outcomes = deque(maxlen=DYNAMIC_MAX_COUNT)  # 最大10個まで保持
-# trading paused until (None or datetime)
-trading_paused_until = None
-# 最後のチャート解析時刻（重複実行防止用）
-last_chart_analysis_time = None
-# チャート上の矢印の総数（新しい矢印検出用）
-last_arrow_count = 0
-# 現在の動的評価数（3から開始、最大10まで増加）
-current_evaluation_count = DYNAMIC_MIN_COUNT
+# トレンドフィルター設定（連敗システムは削除）
+# すべての連敗ストッパー機能を削除しました
 
 # -----------------------
 # FeatureExtraction（既存ロジック準拠）
@@ -379,185 +356,22 @@ def FeatureExtraction(df):
     
     return result
 
-def analyze_price_slope_and_losses(prices, price_times, loss_history):
-    """
-    価格の傾きと直近の負け履歴を分析する（負けエントリー地点基準版）
-    Args:
-        prices: 価格のリスト（最新の価格が最後）
-        price_times: 価格の時刻リスト
-        loss_history: 負け履歴のリスト [(datetime, action_str, result, entry_price), ...]
-    Returns:
-        dict: 分析結果
-    """
-    if len(prices) < 2:
-        return {
-            'price_slope': 0.0,
-            'is_declining': False,
-            'recent_losses': 0,
-            'should_block_high': False,
-            'should_block_low': False,
-            'loss_entry_point': None
-        }
-    
-    # 直近の負け履歴を確認
-    current_time = datetime.now()
-    cutoff_time = current_time - timedelta(minutes=LOSS_LOOKBACK_MINUTES)
-    
-    recent_losses = 0
-    recent_high_losses = 0
-    recent_low_losses = 0
-    first_loss_time = None
-    first_loss_price = None
-    
-    # 時系列順にソートして最初の負けを見つける
-    sorted_losses = sorted([loss for loss in loss_history if loss[0] > cutoff_time and loss[2] == 'loss'], 
-                          key=lambda x: x[0])
-    
-    for loss_time, action, result, entry_price in sorted_losses:
-        recent_losses += 1
-        if action == 'High':
-            recent_high_losses += 1
-        elif action == 'Low':
-            recent_low_losses += 1
-        
-        # 最初の負けの情報を記録
-        if first_loss_time is None:
-            first_loss_time = loss_time
-            first_loss_price = entry_price
-    
-    # 傾きを計算
-    price_slope = 0.0
-    normalized_slope = 0.0
-    
-    if first_loss_time is not None and first_loss_price is not None:
-        # 最初の負けのエントリー地点から現在価格までの傾きを計算
-        current_price = prices[-1]
-        time_diff = (current_time - first_loss_time).total_seconds() / 60.0  # 分単位
-        
-        if time_diff > 0:
-            price_diff = current_price - first_loss_price
-            price_slope = price_diff / time_diff  # 1分あたりの価格変化
-            normalized_slope = price_slope / first_loss_price  # 価格で正規化
-            
-            print(f"[SLOPE DEBUG] 最初の負け: {first_loss_time.strftime('%H:%M:%S')} @ {first_loss_price:.3f}")
-            print(f"[SLOPE DEBUG] 現在価格: {current_price:.3f}, 時間差: {time_diff:.1f}分")
-            print(f"[SLOPE DEBUG] 傾き: {normalized_slope:.8f}")
-    else:
-        # 負け履歴がない場合は従来通り直近の価格で計算
-        if len(prices) >= TREND_LOOKBACK_PERIODS:
-            recent_prices = prices[-TREND_LOOKBACK_PERIODS:]
-            x = np.arange(len(recent_prices))
-            y = np.array(recent_prices)
-            
-            try:
-                slope, intercept = np.polyfit(x, y, 1)
-                normalized_slope = slope / np.mean(recent_prices)
-            except:
-                normalized_slope = 0
-    
-    # 価格が下降傾向かどうか（閾値を緩和）
-    is_declining = normalized_slope < PRICE_SLOPE_THRESHOLD
-    is_rising = normalized_slope > -PRICE_SLOPE_THRESHOLD
-    
-    # フィルター判定（連敗検出時にブロック）
-    should_block_high = (
-        recent_high_losses >= CONSECUTIVE_LOSS_THRESHOLD
-    )
-    
-    should_block_low = (
-        recent_low_losses >= CONSECUTIVE_LOSS_THRESHOLD
-    )
-    
-    # ブロック解除判定（3分経過後に状況が変化したか）
-    block_high_until = None
-    block_low_until = None
-    
-    if should_block_high and first_loss_time:
-        block_high_until = first_loss_time + timedelta(seconds=ENTRY_BLOCK_DURATION_SECONDS)
-        # 3分経過後、トレンドが上昇に変わっていればブロック解除
-        if current_time > block_high_until:
-            if is_rising:  # 上昇トレンドに転換
-                should_block_high = False
-                print(f"[BLOCK RELEASE] High判定ブロック解除（上昇トレンド検出）")
-    
-    if should_block_low and first_loss_time:
-        block_low_until = first_loss_time + timedelta(seconds=ENTRY_BLOCK_DURATION_SECONDS)
-        # 3分経過後、トレンドが下降に変わっていればブロック解除
-        if current_time > block_low_until:
-            if is_declining:  # 下降トレンドに転換
-                should_block_low = False
-                print(f"[BLOCK RELEASE] Low判定ブロック解除（下降トレンド検出）")
-    
-    return {
-        'price_slope': normalized_slope,
-        'is_declining': is_declining,
-        'is_rising': is_rising,
-        'recent_losses': recent_losses,
-        'recent_high_losses': recent_high_losses,
-        'recent_low_losses': recent_low_losses,
-        'should_block_high': should_block_high,
-        'should_block_low': should_block_low,
-        'loss_entry_point': (first_loss_time, first_loss_price) if first_loss_time else None,
-        'raw_slope': price_slope,
-        'block_high_until': block_high_until,
-        'block_low_until': block_low_until
-    }
+# ========================================
+# 連敗システム関連（一時的にコメントアウト）
+# ========================================
+# def analyze_price_slope_and_losses(prices, price_times, loss_history):
+#     """価格の傾きと直近の負け履歴を分析する（負けエントリー地点基準版）"""
+#     ... (省略)
+#
+# def apply_slope_and_loss_filter(action_str, q_values, slope_analysis):
+#     """価格傾きと負け履歴に基づくシンプルなフィルター（連敗時3分間ブロック機能付き）"""
+#     ... (省略)
+# ========================================
 
-def apply_slope_and_loss_filter(action_str, q_values, slope_analysis):
-    """
-    価格傾きと負け履歴に基づくシンプルなフィルター（連敗時3分間ブロック機能付き）
-    Args:
-        action_str: 元のアクション ('High', 'Low', 'Hold')
-        q_values: Q値の配列 [Hold, High, Low]
-        slope_analysis: analyze_price_slope_and_losses()の結果
-    Returns:
-        tuple: (filtered_action_str, reason)
-    """
-    if not TREND_FILTER_ENABLED:
-        return action_str, ""
-    
-    current_time = datetime.now()
-    
-    # High負けが連発している場合、High判定を3分間ブロック
-    if action_str == "High" and slope_analysis['should_block_high']:
-        block_until = slope_analysis.get('block_high_until')
-        if block_until and current_time < block_until:
-            remaining_time = int((block_until - current_time).total_seconds())
-            print(f"[🚫 BLOCK] High負け{slope_analysis['recent_high_losses']}連続 - High判定を{remaining_time}秒間ブロック中")
-            print(f"[SLOPE FILTER] 傾き: {slope_analysis['price_slope']:.6f}")
-            return "Hold", f"high_loss_block_{remaining_time}s(losses:{slope_analysis['recent_high_losses']})"
-        else:
-            print(f"[SLOPE FILTER] High負け連発検出だが、ブロック期間終了 - 状況確認中")
-            print(f"[SLOPE FILTER] 傾き: {slope_analysis['price_slope']:.6f}, 直近High負け: {slope_analysis['recent_high_losses']}回")
-            # ブロック期間終了後は傾向が変わったかチェック済み
-            if slope_analysis.get('is_rising', False):
-                print(f"[✓ UNBLOCK] トレンド転換（上昇）を検出 - High判定を許可")
-                return action_str, ""
-            else:
-                print(f"[BLOCK CONTINUE] まだ下降傾向 - High判定をブロック継続")
-                return "Hold", f"high_loss_trend_continue(slope:{slope_analysis['price_slope']:.6f})"
-    
-    # Low負けが連発している場合、Low判定を3分間ブロック
-    elif action_str == "Low" and slope_analysis['should_block_low']:
-        block_until = slope_analysis.get('block_low_until')
-        if block_until and current_time < block_until:
-            remaining_time = int((block_until - current_time).total_seconds())
-            print(f"[🚫 BLOCK] Low負け{slope_analysis['recent_low_losses']}連続 - Low判定を{remaining_time}秒間ブロック中")
-            print(f"[SLOPE FILTER] 傾き: {slope_analysis['price_slope']:.6f}")
-            return "Hold", f"low_loss_block_{remaining_time}s(losses:{slope_analysis['recent_low_losses']})"
-        else:
-            print(f"[SLOPE FILTER] Low負け連発検出だが、ブロック期間終了 - 状況確認中")
-            print(f"[SLOPE FILTER] 傾き: {slope_analysis['price_slope']:.6f}, 直近Low負け: {slope_analysis['recent_low_losses']}回")
-            # ブロック期間終了後は傾向が変わったかチェック済み
-            if slope_analysis.get('is_declining', False):
-                print(f"[✓ UNBLOCK] トレンド転換（下降）を検出 - Low判定を許可")
-                return action_str, ""
-            else:
-                print(f"[BLOCK CONTINUE] まだ上昇傾向 - Low判定をブロック継続")
-                return "Hold", f"low_loss_trend_continue(slope:{slope_analysis['price_slope']:.6f})"
-    
-    # その他の場合はそのまま
-    return action_str, ""
+# -----------------------
+# ========================================
+# 連敗システム関連ここまで
+# ========================================
 
 # -----------------------
 # human-like 操作関数 (Playwright用)
@@ -1094,146 +908,16 @@ else:
     print("[INFO] スケーラー読み込み成功")
 
 # -----------------------
-# ログ関数 (q値とactionを記録)
+# スクレイピング関数（削除）
 # -----------------------
-def scrape_chart_arrows(page):
-    """
-    チャート上の矢印をスクレイピングして勝敗を判定
-    Args:
-        page: Playwrightのページオブジェクト
-    Returns:
-        list: 右から順番に並んだ勝敗結果 ['win', 'loss', 'win', ...]（最新が先頭）
-    """
-    try:
-        print(f"\n[🎯 CHART] チャート矢印の解析を開始...")
-        print("[🔺 TARGET] 三角矢印検出モード: 黒・グレー矢印は負け判定")
-        
-        # 緊急モード: 全ての矢印を負けとして扱うデバッグモード（通常はFalse）
-        EMERGENCY_MODE = False  # 緊急モードを無効化（色による正確な判定を使用）
-        if EMERGENCY_MODE:
-            print("[🚨 EMERGENCY] 緊急モード: 検出された全ての矢印を負けとして判定")
-        
-        results = []
-        
-        # JavaScript でページ全体を詳しく調査
-        try:
-            page_analysis = page.evaluate("""
-                () => {
-                    const analysis = {
-                        svgs: [],
-                        canvases: [],
-                        arrows: [],
-                        charts: [],
-                        allElements: []
-                    };
-                    
-                    // SVG要素を調査
-                    const svgs = document.querySelectorAll('svg');
-                    svgs.forEach((svg, idx) => {
-                        const rect = svg.getBoundingClientRect();
-                        analysis.svgs.push({
-                            index: idx,
-                            width: rect.width,
-                            height: rect.height,
-                            x: rect.x,
-                            y: rect.y,
-                            classes: svg.className.baseVal || svg.className || '',
-                            id: svg.id || '',
-                            children: svg.children.length,
-                            innerHTML: svg.innerHTML.substring(0, 200)
-                        });
-                    });
-                    
-                    // Canvas要素を調査
-                    const canvases = document.querySelectorAll('canvas');
-                    canvases.forEach((canvas, idx) => {
-                        const rect = canvas.getBoundingClientRect();
-                        analysis.canvases.push({
-                            index: idx,
-                            width: rect.width,
-                            height: rect.height,
-                            x: rect.x,
-                            y: rect.y,
-                            classes: canvas.className || '',
-                            id: canvas.id || ''
-                        });
-                    });
-                    
-                    // チャート関連要素を調査
-                    const chartSelectors = [
-                        '[class*="chart"]',
-                        '[class*="trading"]',
-                        '[class*="candle"]',
-                        '[id*="chart"]',
-                        '[id*="trading"]'
-                    ];
-                    
-                    chartSelectors.forEach(selector => {
-                        try {
-                            const elements = document.querySelectorAll(selector);
-                            elements.forEach((el, idx) => {
-                                const rect = el.getBoundingClientRect();
-                                if (rect.width > 100 && rect.height > 100) { // 大きな要素のみ
-                                    analysis.charts.push({
-                                        selector: selector,
-                                        index: idx,
-                                        tagName: el.tagName,
-                                        classes: el.className || '',
-                                        id: el.id || '',
-                                        width: rect.width,
-                                        height: rect.height,
-                                        children: el.children.length
-                                    });
-                                }
-                            });
-                        } catch(e) {}
-                    });
-                    
-                    // 矢印っぽい要素を広範囲に検索
-                    const arrowSelectors = [
-                        'path', 'circle', 'polygon', 'rect',
-                        '[class*="arrow"]', '[class*="trade"]', '[class*="position"]',
-                        '[class*="buy"]', '[class*="sell"]', '[class*="up"]', '[class*="down"]',
-                        '[style*="fill"]', '[fill]', '[stroke]'
-                    ];
-                    
-                    arrowSelectors.forEach(selector => {
-                        try {
-                            const elements = document.querySelectorAll(selector);
-                            elements.forEach((el, idx) => {
-                                const style = window.getComputedStyle(el);
-                                const fill = style.fill || el.getAttribute('fill') || '';
-                                const stroke = style.stroke || el.getAttribute('stroke') || '';
-                                const color = style.color || el.getAttribute('color') || '';
-                                const backgroundColor = style.backgroundColor || '';
-                                
-                                // 色が設定されている要素のみ
-                                if (fill !== 'none' && fill !== '' || stroke !== 'none' && stroke !== '' || 
-                                    color !== '' || backgroundColor !== '') {
-                                    const rect = el.getBoundingClientRect();
-                                    analysis.allElements.push({
-                                        selector: selector,
-                                        tagName: el.tagName,
-                                        classes: el.className.baseVal || el.className || '',
-                                        id: el.id || '',
-                                        fill: fill,
-                                        stroke: stroke,
-                                        color: color,
-                                        backgroundColor: backgroundColor,
-                                        x: rect.x,
-                                        y: rect.y,
-                                        width: rect.width,
-                                        height: rect.height,
-                                        innerHTML: el.innerHTML ? el.innerHTML.substring(0, 100) : ''
-                                    });
-                                }
-                            });
-                        } catch(e) {}
-                    });
-                    
-                    return analysis;
-                }
-            """)
+# 矢印スクレイピングと連敗ストッパーを全て削除しました
+
+# -----------------------
+# 連敗システム関連（全て削除）
+# -----------------------
+# evaluate_chart_arrows_and_pause, evaluate_recent_outcomes_and_pause,
+# manual_add_arrow_result, test_chart_analysis 等の関数を全て削除しました
+"""
             
             # 矢印らしい要素を特定
             potential_arrows = []
@@ -1450,14 +1134,11 @@ def scrape_chart_arrows(page):
         return []
 
 def scrape_trade_results(page):
-    """
     Webページから取引結果をスクレイピング（チャート矢印版）
     Args:
         page: Playwrightのページオブジェクト
     Returns:
         list: [(entry_time, action_str, result, entry_price), ...]
-    """
-    try:
         # チャート上の矢印を解析
         arrow_results = scrape_chart_arrows(page)
         
@@ -1472,105 +1153,110 @@ def scrape_trade_results(page):
         print(traceback.format_exc())
         return []
 
-def check_trade_result(entry_time, action_str, entry_price, loss_history_ref, page):
-    """
-    取引結果をスクレイピングで確認して負け履歴に追加
-    Args:
-        entry_time: エントリー時刻
-        action_str: アクション（'High' or 'Low'）
-        entry_price: エントリー価格
-        loss_history_ref: 負け履歴リストの参照
-        page: Playwrightのページオブジェクト
-    """
-    try:
-        print(f"\n{'='*60}")
-        print(f"[⏰ RESULT CHECK] {entry_time.strftime('%H:%M:%S')}の{action_str}取引結果確認")
-        print(f"[💰 ENTRY] エントリー価格: {entry_price:.3f}")
-        print(f"{'='*60}")
-        
-        # スクレイピングで取引結果を取得
-        results = scrape_trade_results(page)
-        
-        # 結果から該当する取引を探す（時刻とアクションで一致判定）
-        found = False
-        for result_time, result_action, result_status, result_price in results:
-            time_diff = abs((result_time - entry_time).total_seconds())
-            if time_diff < 10 and result_action == action_str:  # 10秒以内の一致
-                found = True
-                if result_status == 'loss':
-                    loss_history_ref.append((entry_time, action_str, 'loss', entry_price))
-                    print(f"[❌ RESULT] 負け記録追加: {action_str} @ {entry_price:.3f}")
-                    # append recent outcome and evaluate
-                    try:
-                        recent_trade_outcomes.append('loss')
-                        print(f"[RECENT] recent_trade_outcomes: {list(recent_trade_outcomes)}")
-                        paused, triggered = evaluate_recent_outcomes_and_pause(recent_trade_outcomes)
-                        if triggered:
-                            global trading_paused_until
-                            trading_paused_until = paused
-                    except Exception as e:
-                        print(f"[WARN] recent append failed: {e}")
-                else:
-                    print(f"[✅ RESULT] 勝ち: {action_str} @ {entry_price:.3f}")
-                    try:
-                        recent_trade_outcomes.append('win')
-                        print(f"[RECENT] recent_trade_outcomes: {list(recent_trade_outcomes)}")
-                    except Exception:
-                        pass
-                break
-        
-        if not found:
-            print(f"\n[⚠️ WARNING] 自動検出できませんでした")
-            print(f"[📋 手動記録方法]")
-            print(f"  負けた場合:")
-            print(f"    add_loss_to_history(loss_history, '{action_str}', {entry_price:.3f})")
-            print(f"  勝った場合:")
-            print(f"    （何もしなくてOK）")
-            print(f"{'='*60}\n")
-        
-    except Exception as e:
-        print(f"[ERROR] 取引結果確認エラー: {e}")
-
-def add_loss_to_history(loss_history, action_str, entry_price, entry_time=None):
-    """
-    手動で負け履歴に追加するヘルパー関数
-    Args:
-        loss_history: 負け履歴リスト
-        action_str: 負けたアクション（'High' or 'Low'）
-        entry_price: エントリー価格
-        entry_time: エントリー時刻（Noneの場合は現在時刻）
-    """
-    if entry_time is None:
-        entry_time = datetime.now()
-    
-    loss_history.append((entry_time, action_str, 'loss', entry_price))
-    print(f"\n{'='*60}")
-    print(f"[✍️ MANUAL LOSS] 負け履歴を手動追加しました")
-    print(f"[📅 時刻] {entry_time.strftime('%H:%M:%S')}")
-    print(f"[📊 方向] {action_str}")
-    print(f"[💰 価格] {entry_price:.3f}")
-    print(f"[📈 累計] 直近の負け - High:{sum(1 for _, a, _, _ in loss_history if a == 'High')}回, Low:{sum(1 for _, a, _, _ in loss_history if a == 'Low')}回")
-    print(f"{'='*60}\n")
-    
-    # 古い履歴をクリーンアップ
-    cutoff_time = datetime.now() - timedelta(minutes=LOSS_LOOKBACK_MINUTES * 2)
-    old_count = len(loss_history)
-    loss_history[:] = [loss for loss in loss_history if loss[0] > cutoff_time]
-    cleaned = old_count - len(loss_history)
-    if cleaned > 0:
-        print(f"[🗑️ CLEANUP] 古い履歴{cleaned}件を削除しました")
-
-    # recent_trade_outcomesに'loss'を追加して評価
-    try:
-        recent_trade_outcomes.append('loss')
-        print(f"[RECENT] recent_trade_outcomes: {list(recent_trade_outcomes)}")
-        paused, triggered = evaluate_recent_outcomes_and_pause(recent_trade_outcomes)
-        if triggered:
-            global trading_paused_until
-            trading_paused_until = paused
-    except Exception as e:
-        print(f"[WARN] recent outcome append failed: {e}")
-
+# ========================================
+# 連敗システム関連の取引結果チェック（一時的にコメントアウト）
+# ========================================
+# def check_trade_result(entry_time, action_str, entry_price, loss_history_ref, page):
+#     """
+#     取引結果をスクレイピングで確認して負け履歴に追加
+#     Args:
+#         entry_time: エントリー時刻
+#         action_str: アクション（'High' or 'Low'）
+#         entry_price: エントリー価格
+#         loss_history_ref: 負け履歴リストの参照
+#         page: Playwrightのページオブジェクト
+#     """
+#     try:
+#         print(f"\n{'='*60}")
+#         print(f"[⏰ RESULT CHECK] {entry_time.strftime('%H:%M:%S')}の{action_str}取引結果確認")
+#         print(f"[💰 ENTRY] エントリー価格: {entry_price:.3f}")
+#         print(f"{'='*60}")
+#         
+#         # スクレイピングで取引結果を取得
+#         results = scrape_trade_results(page)
+#         
+#         # 結果から該当する取引を探す（時刻とアクションで一致判定）
+#         found = False
+#         for result_time, result_action, result_status, result_price in results:
+#             time_diff = abs((result_time - entry_time).total_seconds())
+#             if time_diff < 10 and result_action == action_str:  # 10秒以内の一致
+#                 found = True
+#                 if result_status == 'loss':
+#                     loss_history_ref.append((entry_time, action_str, 'loss', entry_price))
+#                     print(f"[❌ RESULT] 負け記録追加: {action_str} @ {entry_price:.3f}")
+#                     # append recent outcome and evaluate
+#                     try:
+#                         recent_trade_outcomes.append('loss')
+#                         print(f"[RECENT] recent_trade_outcomes: {list(recent_trade_outcomes)}")
+#                         paused, triggered = evaluate_recent_outcomes_and_pause(recent_trade_outcomes)
+#                         if triggered:
+#                             global trading_paused_until
+#                             trading_paused_until = paused
+#                     except Exception as e:
+#                         print(f"[WARN] recent append failed: {e}")
+#                 else:
+#                     print(f"[✅ RESULT] 勝ち: {action_str} @ {entry_price:.3f}")
+#                     try:
+#                         recent_trade_outcomes.append('win')
+#                         print(f"[RECENT] recent_trade_outcomes: {list(recent_trade_outcomes)}")
+#                     except Exception:
+#                         pass
+#                 break
+#         
+#         if not found:
+#             print(f"\n[⚠️ WARNING] 自動検出できませんでした")
+#             print(f"[📋 手動記録方法]")
+#             print(f"  負けた場合:")
+#             print(f"    add_loss_to_history(loss_history, '{action_str}', {entry_price:.3f})")
+#             print(f"  勝った場合:")
+#             print(f"    （何もしなくてOK）")
+#             print(f"{'='*60}\n")
+#         
+#     except Exception as e:
+#         print(f"[ERROR] 取引結果確認エラー: {e}")
+# 
+# def add_loss_to_history(loss_history, action_str, entry_price, entry_time=None):
+#     """
+#     手動で負け履歴に追加するヘルパー関数
+#     Args:
+#         loss_history: 負け履歴リスト
+#         action_str: 負けたアクション（'High' or 'Low'）
+#         entry_price: エントリー価格
+#         entry_time: エントリー時刻（Noneの場合は現在時刻）
+#     """
+#     if entry_time is None:
+#         entry_time = datetime.now()
+#     
+#     loss_history.append((entry_time, action_str, 'loss', entry_price))
+#     print(f"\n{'='*60}")
+#     print(f"[✍️ MANUAL LOSS] 負け履歴を手動追加しました")
+#     print(f"[📅 時刻] {entry_time.strftime('%H:%M:%S')}")
+#     print(f"[📊 方向] {action_str}")
+#     print(f"[💰 価格] {entry_price:.3f}")
+#     print(f"[📈 累計] 直近の負け - High:{sum(1 for _, a, _, _ in loss_history if a == 'High')}回, Low:{sum(1 for _, a, _, _ in loss_history if a == 'Low')}回")
+#     print(f"{'='*60}\n")
+#     
+#     # 古い履歴をクリーンアップ
+#     cutoff_time = datetime.now() - timedelta(minutes=LOSS_LOOKBACK_MINUTES * 2)
+#     old_count = len(loss_history)
+#     loss_history[:] = [loss for loss in loss_history if loss[0] > cutoff_time]
+#     cleaned = old_count - len(loss_history)
+#     if cleaned > 0:
+#         print(f"[🗑️ CLEANUP] 古い履歴{cleaned}件を削除しました")
+# 
+#     # recent_trade_outcomesに'loss'を追加して評価
+#     try:
+#         recent_trade_outcomes.append('loss')
+#         print(f"[RECENT] recent_trade_outcomes: {list(recent_trade_outcomes)}")
+#         paused, triggered = evaluate_recent_outcomes_and_pause(recent_trade_outcomes)
+#         if triggered:
+#             global trading_paused_until
+#             trading_paused_until = paused
+#     except Exception as e:
+#         print(f"[WARN] recent outcome append failed: {e}")
+# ========================================
+# 連敗システム関連ここまで
+# ========================================
 
 def evaluate_chart_arrows_and_pause(page):
     """
@@ -1697,26 +1383,32 @@ def evaluate_recent_outcomes_and_pause(recent_trade_outcomes, trading_paused_unt
         print(f"[ERROR] evaluate_recent_outcomes_and_pause error: {e}")
         return None, False
 
-def add_last_trade_loss(loss_history, pending_trades):
-    """
-    直近のエントリーを負けとして記録する簡易関数
-    Args:
-        loss_history: 負け履歴リスト
-        pending_trades: 待機中の取引リスト
-    """
-    if pending_trades:
-        # 最後のエントリーを取得
-        last_trade = pending_trades[-1]
-        entry_time, action_str, entry_price = last_trade
-        add_loss_to_history(loss_history, action_str, entry_price, entry_time)
-        # 待機リストから削除
-        pending_trades.remove(last_trade)
-        print(f"[INFO] 待機リストから削除しました")
-    else:
-        print(f"[⚠️ WARNING] 記録する取引がありません")
-        print(f"[INFO] 直接記録する場合:")
-        print(f"  add_loss_to_history(loss_history, 'High', 150.123)  # High負け")
-        print(f"  add_loss_to_history(loss_history, 'Low', 150.123)   # Low負け")
+# ========================================
+# 連敗システム関連（一時的にコメントアウト）
+# ========================================
+# def add_last_trade_loss(loss_history, pending_trades):
+#     """
+#     直近のエントリーを負けとして記録する簡易関数
+#     Args:
+#         loss_history: 負け履歴リスト
+#         pending_trades: 待機中の取引リスト
+#     """
+#     if pending_trades:
+#         # 最後のエントリーを取得
+#         last_trade = pending_trades[-1]
+#         entry_time, action_str, entry_price = last_trade
+#         add_loss_to_history(loss_history, action_str, entry_price, entry_time)
+#         # 待機リストから削除
+#         pending_trades.remove(last_trade)
+#         print(f"[INFO] 待機リストから削除しました")
+#     else:
+#         print(f"[⚠️ WARNING] 記録する取引がありません")
+#         print(f"[INFO] 直接記録する場合:")
+#         print(f"  add_loss_to_history(loss_history, 'High', 150.123)  # High負け")
+#         print(f"  add_loss_to_history(loss_history, 'Low', 150.123)   # Low負け")
+# ========================================
+# 連敗システム終わり
+# ========================================
 
 def test_chart_analysis(page):
     """
@@ -1893,15 +1585,15 @@ with sync_playwright() as p:
 
     # ループ準備
     all_ticks = []
-    loss_history = []  # 負け履歴: [(datetime, action_str, result, entry_price), ...]
-    pending_trades = []  # エントリー待ちの取引: [(entry_time, action_str, entry_price), ...]
+    # loss_history = []  # 負け履歴: [(datetime, action_str, result, entry_price), ...] ※連敗システムコメントアウト
+    # pending_trades = []  # エントリー待ちの取引: [(entry_time, action_str, entry_price), ...] ※連敗システムコメントアウト
     # recent_trade_outcomes and trading_paused_until are module-level
     last_entry_time = None
     next_entry_allowed_time = None
     recent_prices = deque(maxlen= int(10 / max(TICK_INTERVAL_SECONDS, 0.001)) + 2)
     
     print("\n" + "="*80)
-    print("🤖 DQN自動取引BOT - 連敗フィルター機能付き")
+    print("🤖 DQN自動取引BOT - チャート矢印フィルター機能付き")
     print("="*80)
     print("\n📊 負け履歴管理機能の使い方")
     print("-"*80)
@@ -1917,35 +1609,9 @@ with sync_playwright() as p:
     print("【方法3】過去の取引を記録する場合:")
     print("  >>> from datetime import datetime, timedelta")
     print("  >>> past_time = datetime.now() - timedelta(minutes=2)")
-    print("  >>> add_loss_to_history(loss_history, 'High', 150.123, past_time)")
     print("")
-    print("【チャート矢印テスト用】🧪")
-    print("  現在のチャート解析をテスト:")
-    print("    >>> test_chart_analysis(page)")
-    print("  手動で矢印結果を追加:")
-    print("    >>> manual_add_arrow_result('loss')  # グレー矢印")
-    print("    >>> manual_add_arrow_result('win')   # 赤・緑矢印")
-    print("")
-    print("🔥 フィルター設定:")
-    print(f"【従来の連敗フィルター】")
-    print(f"  - 連続負け閾値: {CONSECUTIVE_LOSS_THRESHOLD}回")
-    print(f"  - ブロック時間: {ENTRY_BLOCK_DURATION_SECONDS}秒（{ENTRY_BLOCK_DURATION_SECONDS//60}分）")
-    print(f"  - 履歴参照期間: {LOSS_LOOKBACK_MINUTES}分")
-    print(f"【新・動的チャート矢印フィルター】🎯")
-    print(f"  - 動的評価: 右から矢印{DYNAMIC_MIN_COUNT}個（開始時）→ {DYNAMIC_MAX_COUNT}個（最大）")
-    print(f"  - 負け率閾値: {int(LOSS_RATE_THRESHOLD*100)}%以上でブロック")
-    print(f"  - ブロック時間: {RECENT_BLOCK_SECONDS}秒（{RECENT_BLOCK_SECONDS//60}分）")
-    print(f"  - 自動解析: 10秒ごとにチャート確認")
-    print(f"  - カウントリセット: ブロック終了後は{DYNAMIC_MIN_COUNT}個から再開")
-    print("")
-    print("🎯 動的矢印フィルター設定:")
-    print(f"  - 初期確認数: {DYNAMIC_MIN_COUNT}個（BOT再開直後）")
-    print(f"  - 最大確認数: {DYNAMIC_MAX_COUNT}個（段階的に増加）")
-    print(f"  - 負け率閾値: {int(LOSS_RATE_THRESHOLD*100)}%以上でブロック")
-    print(f"  - ブロック時間: {RECENT_BLOCK_SECONDS}秒（{RECENT_BLOCK_SECONDS//60}分）")
-    print("")
-    print("※取引結果は60秒後に自動確認を試みますが、")
-    print("  確実に記録したい場合は上記コマンドで手動登録してください。")
+    print("🔥 すべての連敗ストッパーと矢印スクレイピングを削除しました")
+    print("   DQNの判定のみで取引を行います")
     print("="*80 + "\n")
 
     while True:
@@ -2112,125 +1778,74 @@ with sync_playwright() as p:
                 time.sleep(TICK_INTERVAL_SECONDS)
                 continue
 
-            # チャート矢印を定期的にチェック（10秒ごと、停止中も評価して解除条件をチェック）
-            # ただし、既に停止中の場合は新しい評価をスキップ
-            if current_time.second % 10 < TICK_INTERVAL_SECONDS:
-                try:
-                    # 重複実行を防ぐため、最後の解析から5秒以上経過している場合のみ実行
-                    if (last_chart_analysis_time is None or 
-                        (current_time - last_chart_analysis_time).total_seconds() >= 5):
-                        
-                        # 停止中でも評価を実行して解除条件をチェック
-                        last_chart_analysis_time = current_time
-                        paused_until, triggered = evaluate_chart_arrows_and_pause(page)
-                        
-                        # 停止解除された場合（paused_until=None, triggered=False）
-                        if not triggered and paused_until is None:
-                            if trading_paused_until and current_time < trading_paused_until:
-                                # 停止中だったが解除された
-                                print(f"[✅ CHART UNBLOCK] 条件クリアによりブロック解除！")
-                                trading_paused_until = None
-                                # 再開時に過去の履歴をクリアして、新しいデータのみを使用
-                                recent_trade_outcomes.clear()
-                                # 評価数を3にリセット（既に関数内でリセット済み）
-                                # 現在のWebサイト上の矢印個数を取得して、それをベースラインとする
-                                try:
-                                    current_arrows = scrape_chart_arrows(page)
-                                    last_arrow_count = len(current_arrows)
-                                    print(f"[🔄 RESET] 矢印履歴をクリアしました（評価数: {current_evaluation_count}から再開、現在Web上: {last_arrow_count}個）")
-                                except:
-                                    last_arrow_count = 0
-                                    print(f"[� RESET] 矢印履歴をクリアしました（評価数: {current_evaluation_count}から再開）")
-                            elif trading_paused_until and current_time >= trading_paused_until:
-                                # タイムアウトで停止期間が終了した場合
-                                print(f"[⏰ TIMEOUT] チャート矢印ブロックの時間切れ")
-                                trading_paused_until = None
-                                # 再開時に過去の履歴をクリアして、新しいデータのみを使用
-                                recent_trade_outcomes.clear()
-                                # 評価数を3にリセット
-                                current_evaluation_count = DYNAMIC_MIN_COUNT
-                                # 現在のWebサイト上の矢印個数を取得して、それをベースラインとする
-                                try:
-                                    current_arrows = scrape_chart_arrows(page)
-                                    last_arrow_count = len(current_arrows)
-                                    print(f"[🔄 RESET] 矢印履歴をクリアしました（評価数: {current_evaluation_count}から再開、現在Web上: {last_arrow_count}個）")
-                                except:
-                                    last_arrow_count = 0
-                                    print(f"[🔄 RESET] 矢印履歴をクリアしました（評価数: {current_evaluation_count}から再開）")
-                        
-                        # 新規停止または停止継続の場合
-                        elif triggered:
-                            was_paused = trading_paused_until and current_time < trading_paused_until
-                            trading_paused_until = paused_until
-                            if was_paused:
-                                print(f"[🚫 CHART BLOCK CONTINUE] チャート矢印停止継続中")
-                            else:
-                                print(f"[🚫 CHART BLOCK START] チャート矢印によりトレード一時停止開始")
-                except Exception as e:
-                    print(f"[WARN] チャート矢印評価エラー: {e}")
-                    # エラー時は手動記録モードにフォールバック
-                    print(f"[INFO] 手動記録モードで継続します")
+            # 連敗ストッパーと矢印スクレイピングを全て削除しました
+            # チャート矢印による一時停止システムを廃止
 
-            # 価格傾きと負け履歴分析を実行
-            price_history = [t[1] for t in all_ticks[-TREND_LOOKBACK_PERIODS:]] if len(all_ticks) >= TREND_LOOKBACK_PERIODS else [t[1] for t in all_ticks]
-            time_history = [t[0] for t in all_ticks[-TREND_LOOKBACK_PERIODS:]] if len(all_ticks) >= TREND_LOOKBACK_PERIODS else [t[0] for t in all_ticks]
-            slope_analysis = analyze_price_slope_and_losses(price_history, time_history, loss_history)
-            
-            # 傾きと負け履歴フィルターを適用
-            original_action = action_str
-            action_str, filter_reason = apply_slope_and_loss_filter(action_str, q_values, slope_analysis)
-            
-            # アクションが変更された場合、action_idxも更新
-            if action_str != original_action:
-                action_map_reverse = {"Hold": 0, "High": 1, "Low": 2}
-                action_idx = action_map_reverse.get(action_str, 0)
-            
-            # 傾き・負け履歴情報をログ出力
-            if TREND_FILTER_ENABLED:
-                direction = "下降" if slope_analysis['is_declining'] else "上昇/横ばい"
-                print(f"\n[📈 SLOPE] 傾き方向:{direction}, 傾き値:{slope_analysis['price_slope']:.8f}")
-                
-                if slope_analysis['loss_entry_point']:
-                    loss_time, loss_price = slope_analysis['loss_entry_point']
-                    print(f"[📍 SLOPE] 基準点: {loss_time.strftime('%H:%M:%S')} @ {loss_price:.3f} (最初の負けエントリー)")
-                else:
-                    print(f"[📍 SLOPE] 基準点: 直近{TREND_LOOKBACK_PERIODS}期間の線形回帰")
-                
-                print(f"[📊 LOSS] 直近負け - High:{slope_analysis['recent_high_losses']}回, Low:{slope_analysis['recent_low_losses']}回")
-                
-                # ブロック状態の詳細表示
-                if slope_analysis['should_block_high']:
-                    block_until = slope_analysis.get('block_high_until')
-                    if block_until:
-                        remaining = int((block_until - current_time).total_seconds())
-                        if remaining > 0:
-                            print(f"[🚫 BLOCK] High判定ブロック中 - 残り{remaining}秒（{block_until.strftime('%H:%M:%S')}まで）")
-                        else:
-                            print(f"[⏰ BLOCK] Highブロック期間終了 - トレンド確認中")
-                    else:
-                        print(f"[🚫 WARNING] High判定ブロック条件検出")
-                
-                if slope_analysis['should_block_low']:
-                    block_until = slope_analysis.get('block_low_until')
-                    if block_until:
-                        remaining = int((block_until - current_time).total_seconds())
-                        if remaining > 0:
-                            print(f"[🚫 BLOCK] Low判定ブロック中 - 残り{remaining}秒（{block_until.strftime('%H:%M:%S')}まで）")
-                        else:
-                            print(f"[⏰ BLOCK] Lowブロック期間終了 - トレンド確認中")
-                    else:
-                        print(f"[🚫 WARNING] Low判定ブロック条件検出")
-                
-                if original_action != action_str:
-                    print(f"[🛡️ FILTER] アクション変更: {original_action} -> {action_str}")
+            # ========================================
+            # 連敗システムによるフィルター（削除済み）
+            # ========================================
+            # time_history = [t[0] for t in all_ticks[-TREND_LOOKBACK_PERIODS:]] if len(all_ticks) >= TREND_LOOKBACK_PERIODS else [t[0] for t in all_ticks]
+            # slope_analysis = analyze_price_slope_and_losses(price_history, time_history, loss_history)
+            # 
+            # # 傾きと負け履歴フィルターを適用
+            # original_action = action_str
+            # action_str, filter_reason = apply_slope_and_loss_filter(action_str, q_values, slope_analysis)
+            # 
+            # # アクションが変更された場合、action_idxも更新
+            # if action_str != original_action:
+            #     action_map_reverse = {"Hold": 0, "High": 1, "Low": 2}
+            #     action_idx = action_map_reverse.get(action_str, 0)
+            # 
+            # # 傾き・負け履歴情報をログ出力
+            # if TREND_FILTER_ENABLED:
+            #     direction = "下降" if slope_analysis['is_declining'] else "上昇/横ばい"
+            #     print(f"\n[📈 SLOPE] 傾き方向:{direction}, 傾き値:{slope_analysis['price_slope']:.8f}")
+            #     
+            #     if slope_analysis['loss_entry_point']:
+            #         loss_time, loss_price = slope_analysis['loss_entry_point']
+            #         print(f"[📍 SLOPE] 基準点: {loss_time.strftime('%H:%M:%S')} @ {loss_price:.3f} (最初の負けエントリー)")
+            #     else:
+            #         print(f"[📍 SLOPE] 基準点: 直近{TREND_LOOKBACK_PERIODS}期間の線形回帰")
+            #     
+            #     print(f"[📊 LOSS] 直近負け - High:{slope_analysis['recent_high_losses']}回, Low:{slope_analysis['recent_low_losses']}回")
+            # 
+            #     # ブロック状態の詳細表示
+            #     if slope_analysis['should_block_high']:
+            #         block_until = slope_analysis.get('block_high_until')
+            #         if block_until:
+            #             remaining = int((block_until - current_time).total_seconds())
+            #             if remaining > 0:
+            #                 print(f"[🚫 BLOCK] High判定ブロック中 - 残り{remaining}秒（{block_until.strftime('%H:%M:%S')}まで）")
+            #             else:
+            #                 print(f"[⏰ BLOCK] Highブロック期間終了 - トレンド確認中")
+            #         else:
+            #             print(f"[🚫 WARNING] High判定ブロック条件検出")
+            #     
+            #     if slope_analysis['should_block_low']:
+            #         block_until = slope_analysis.get('block_low_until')
+            #         if block_until:
+            #             remaining = int((block_until - current_time).total_seconds())
+            #             if remaining > 0:
+            #                 print(f"[🚫 BLOCK] Low判定ブロック中 - 残り{remaining}秒（{block_until.strftime('%H:%M:%S')}まで）")
+            #             else:
+            #                 print(f"[⏰ BLOCK] Lowブロック期間終了 - トレンド確認中")
+            #         else:
+            #             print(f"[🚫 WARNING] Low判定ブロック条件検出")
+            #     
+            #     if original_action != action_str:
+            #         print(f"[🛡️ FILTER] アクション変更: {original_action} -> {action_str}")
+            # ========================================
+            # 連敗システム終わり
+            # ========================================
 
             # Decide entry: skip Hold
             if action_str == "Hold":
-                reason = filter_reason or "hold"
+                # reason = filter_reason or "hold"  # 連敗システムコメントアウト
+                reason = "hold"
                 entry = False
                 print(f"[{current_time.strftime('%H:%M:%S')}] Hold - Q値: Hold={q_values[0]:.3f}, High={q_values[1]:.3f}, Low={q_values[2]:.3f}")
-                if filter_reason:
-                    print(f"[{current_time.strftime('%H:%M:%S')}] トレンドフィルターによりHold: {filter_reason}")
+                # if filter_reason:  # 連敗システムコメントアウト
+                #     print(f"[{current_time.strftime('%H:%M:%S')}] トレンドフィルターによりHold: {filter_reason}")
             else:
                 # optionally require q advantage over hold
                 q_advantage = q_values[action_idx] - q_values[0]
@@ -2255,14 +1870,15 @@ with sync_playwright() as p:
                             last_entry_time = current_time
                             next_entry_allowed_time = current_time + timedelta(seconds=ENTRY_COOLDOWN_SECONDS)
                             entry = True
-                            reason = filter_reason or "entry_executed"
+                            # reason = filter_reason or "entry_executed"  # 連敗システムコメントアウト
+                            reason = "entry_executed"
                             print(f"[ENTRY] {action_str} at {current_time.strftime('%H:%M:%S')} price={current_price} Q値: {q_values[action_idx]:.3f} (優位性: {q_advantage:.3f})")
-                            if original_action != action_str:
-                                print(f"[ENTRY] 元の予測:{original_action} -> トレンドフィルター適用後:{action_str}")
+                            # if original_action != action_str:  # 連敗システムコメントアウト
+                            #     print(f"[ENTRY] 元の予測:{original_action} -> トレンドフィルター適用後:{action_str}")
                             
-                            # 取引を待ちリストに追加（60秒後に結果確認）
-                            pending_trades.append((current_time, action_str, current_price))
-                            print(f"[INFO] 取引を待ちリストに追加（60秒後に結果確認）")
+                            # 取引を待ちリストに追加（60秒後に結果確認）※連敗システムコメントアウト
+                            # pending_trades.append((current_time, action_str, current_price))
+                            # print(f"[INFO] 取引を待ちリストに追加（60秒後に結果確認）")
                         else:
                             reason = "button_not_found"
                             entry = False
@@ -2273,76 +1889,49 @@ with sync_playwright() as p:
                     print(f"[{current_time.strftime('%H:%M:%S')}] {action_str} - Q値優位性不足 ({q_advantage:.3f} < {DQN_Q_MARGIN})")
 
             # log
-            slope_info = slope_analysis if 'slope_analysis' in locals() else None
+            # slope_info = slope_analysis if 'slope_analysis' in locals() else None  # 連敗システムコメントアウト
+            slope_info = None
             _log_signal(current_time, current_price, phase, q_values, action_idx, action_str, entry, reason, slope_info)
 
+            # ========================================
+            # 待機中の取引結果確認（連敗システム）※コメントアウト
+            # ========================================
+            # 連敗システム関連（一時的にコメントアウト）
+            # ========================================
             # 待機中の取引結果を確認（60秒経過したもの）
-            completed_trades = []
-            for trade_time, trade_action, trade_price in pending_trades[:]:
-                time_elapsed = (current_time - trade_time).total_seconds()
-                if time_elapsed >= 60:  # 60秒経過（1分BO終了）
-                    print(f"\n[⏰ CHECK] {trade_action}取引の結果確認 (エントリー: {trade_time.strftime('%H:%M:%S')} @ {trade_price:.3f})")
-                    check_trade_result(trade_time, trade_action, trade_price, loss_history, page)
-                    completed_trades.append((trade_time, trade_action, trade_price))
-                elif time_elapsed >= 50:  # 50秒経過で事前通知
-                    remaining = 60 - int(time_elapsed)
-                    if remaining > 0 and remaining % 5 == 0:  # 5秒ごとに表示
-                        print(f"[⏳ PENDING] {trade_action}取引の結果確認まで{remaining}秒...")
-            
-            # 確認済みの取引を待ちリストから削除
-            for completed in completed_trades:
-                if completed in pending_trades:
-                    pending_trades.remove(completed)
-            
-            # 待機中の取引がある場合は表示（1分ごと）
-            if pending_trades and current_time.second % 60 < TICK_INTERVAL_SECONDS:
-                print(f"\n[📋 PENDING TRADES] 結果待ち: {len(pending_trades)}件")
-                for trade_time, trade_action, trade_price in pending_trades:
-                    elapsed = int((current_time - trade_time).total_seconds())
-                    print(f"  - {trade_action} @ {trade_price:.3f} ({trade_time.strftime('%H:%M:%S')}, {elapsed}秒経過)")
-            
-            # 状態を定期的に表示（30秒ごと）
+            # completed_trades = []
+            # for trade_time, trade_action, trade_price in pending_trades[:]:
+            #     time_elapsed = (current_time - trade_time).total_seconds()
+            #     if time_elapsed >= 60:  # 60秒経過（1分BO終了）
+            #         print(f"\n[⏰ CHECK] {trade_action}取引の結果確認 (エントリー: {trade_time.strftime('%H:%M:%S')} @ {trade_price:.3f})")
+            #         check_trade_result(trade_time, trade_action, trade_price, loss_history, page)
+            #         completed_trades.append((trade_time, trade_action, trade_price))
+            #     elif time_elapsed >= 50:  # 50秒経過で事前通知
+            #         remaining = 60 - int(time_elapsed)
+            #         if remaining > 0 and remaining % 5 == 0:  # 5秒ごとに表示
+            #             print(f"[⏳ PENDING] {trade_action}取引の結果確認まで{remaining}秒...")
+            # 
+            # # 確認済みの取引を待ちリストから削除
+            # for completed in completed_trades:
+            #     if completed in pending_trades:
+            #         pending_trades.remove(completed)
+            # 
+            # # 待機中の取引がある場合は表示（1分ごと）
+            # if pending_trades and current_time.second % 60 < TICK_INTERVAL_SECONDS:
+            #     print(f"\n[📋 PENDING TRADES] 結果待ち: {len(pending_trades)}件")
+            #     for trade_time, trade_action, trade_price in pending_trades:
+            #         elapsed = int((current_time - trade_time).total_seconds())
+            #         print(f"  - {trade_action} @ {trade_price:.3f} ({trade_time.strftime('%H:%M:%S')}, {elapsed}秒経過)")
+            # ========================================
+            # 連敗システム終わり
+            # ========================================            # 状態を定期的に表示（30秒ごと）
             if current_time.second % 30 < TICK_INTERVAL_SECONDS:
                 print(f"\n[📊 STATUS] システム状態")
                 
-                # チャート矢印による一時停止状態
-                if trading_paused_until:
-                    if current_time < trading_paused_until:
-                        remaining = int((trading_paused_until - current_time).total_seconds())
-                        print(f"  🚫 チャート矢印ブロック: 残り{remaining}秒 ({trading_paused_until.strftime('%H:%M:%S')}まで)")
-                    else:
-                        print(f"  ✅ チャート矢印ブロック: 解除済み")
-                        trading_paused_until = None  # クリア
-                else:
-                    print(f"  ✅ チャート矢印ブロック: なし")
+                # チャート矢印による一時停止システムは削除されました
+                print(f"  ✅ 連敗ストッパー: 廃止済み")
                 
-                # 手動負け履歴
-                if loss_history:
-                    cutoff = current_time - timedelta(minutes=LOSS_LOOKBACK_MINUTES)
-                    recent_losses = [l for l in loss_history if l[0] > cutoff]
-                    high_losses = sum(1 for _, a, _, _ in recent_losses if a == 'High')
-                    low_losses = sum(1 for _, a, _, _ in recent_losses if a == 'Low')
-                    
-                    print(f"  📋 手動負け履歴 (直近{LOSS_LOOKBACK_MINUTES}分):")
-                    print(f"    - High負け: {high_losses}回 {'🚫ブロック対象' if high_losses >= CONSECUTIVE_LOSS_THRESHOLD else ''}")
-                    print(f"    - Low負け: {low_losses}回 {'🚫ブロック対象' if low_losses >= CONSECUTIVE_LOSS_THRESHOLD else ''}")
-                else:
-                    print(f"  📋 手動負け履歴: なし")
-                
-                # recent arrow status（動的システム）
-                recent_outcomes = list(recent_trade_outcomes)
-                eval_count = min(current_evaluation_count, len(recent_outcomes))
-                recent_loss_count = sum(1 for o in recent_outcomes[-eval_count:] if o == 'loss')
-                loss_rate = (recent_loss_count / eval_count * 100) if eval_count > 0 else 0
-                
-                print(f"\n[🎯 DYNAMIC ARROWS] 直近{eval_count}回の結果（現在の評価数: {current_evaluation_count}/{DYNAMIC_MAX_COUNT}）")
-                print(f"  - 負け: {recent_loss_count}回（負け率: {loss_rate:.1f}%） {'🚫ブロック対象' if loss_rate >= LOSS_RATE_THRESHOLD * 100 else ''}")
-                if recent_outcomes:
-                    arrows = ''.join(['❌' if o == 'loss' else '✅' for o in recent_outcomes[-10:]])
-                    print(f"  - 矢印: {arrows} (右から左へ)")
-                if trading_paused_until and current_time < trading_paused_until:
-                    remaining = int((trading_paused_until - current_time).total_seconds())
-                    print(f"  - ⏸️ トレード停止中: あと{remaining}秒")
+                # recent arrow statusも削除されました
             
             # prune ticks older than e.g. 2 hours to keep memory bounded
             two_hours_ago = current_time - timedelta(hours=2)
