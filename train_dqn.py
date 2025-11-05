@@ -809,6 +809,37 @@ def train_dqn(ohlc_df, pair=pair, save_dir="./Models",
         start_time = datetime(2020, 1, 1, 0, 0, 0)
         ohlc_df.index = pd.date_range(start=start_time, periods=len(ohlc_df), freq='1min')
         print(f"[INFO] Created DatetimeIndex from {start_time}")
+    
+    # ====== データ拡張: 価格反転でHigh/Lowバランスを改善 ======
+    print("\n" + "="*80)
+    print("[INFO] データ拡張を適用 - High/Lowバランス改善")
+    print("="*80)
+    
+    original_len = len(ohlc_df)
+    
+    # オリジナルデータの中心価格を計算
+    center_price = ohlc_df['close'].mean()
+    
+    # 価格を反転させた拡張データを作成
+    augmented_df = ohlc_df.copy()
+    augmented_df['open'] = 2 * center_price - augmented_df['open']
+    augmented_df['high'] = 2 * center_price - augmented_df['low']  # high <-> low を入れ替え
+    augmented_df['low'] = 2 * center_price - ohlc_df['high']
+    augmented_df['close'] = 2 * center_price - augmented_df['close']
+    
+    # インデックスを調整（時間をずらす）
+    if isinstance(augmented_df.index, pd.DatetimeIndex):
+        augmented_df.index = augmented_df.index + pd.Timedelta(days=365*10)  # 10年後にずらす
+    
+    # オリジナルと拡張データを結合
+    ohlc_df = pd.concat([ohlc_df, augmented_df], axis=0)
+    ohlc_df = ohlc_df.sort_index()
+    
+    print(f"[DATA AUGMENTATION] オリジナル: {original_len}行")
+    print(f"[DATA AUGMENTATION] 拡張後: {len(ohlc_df)}行 (2倍)")
+    print(f"[DATA AUGMENTATION] 中心価格: {center_price:.5f}")
+    print(f"[INFO] 価格反転により、Highで有利なパターン → Lowで有利なパターンに変換")
+    print("="*80 + "\n")
 
     # 入力次元を確定（超多くの履歴を使用）
     window_size = 75  # 80%勝率確実達成のためウィンドウサイズを超拡大
