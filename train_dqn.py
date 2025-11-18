@@ -810,35 +810,28 @@ def train_dqn(ohlc_df, pair=pair, save_dir="./Models",
         ohlc_df.index = pd.date_range(start=start_time, periods=len(ohlc_df), freq='1min')
         print(f"[INFO] Created DatetimeIndex from {start_time}")
     
-    # ====== データ拡張: 価格反転でHigh/Lowバランスを改善 ======
+    # ====== High/Lowバランス改善のための推奨事項 ======
+    # 時系列データの価格反転は不適切（トレンド特性が破壊される）
+    # 
+    # 【推奨される解決策】
+    # 1. 上昇/下降両方を含む長期間データを使用
+    #    - 例: 2年以上のデータ（トレンド転換を複数含む）
+    # 
+    # 2. 複数通貨ペアのデータを統合
+    #    - USDJPY + EURUSD + AUDJPY など
+    #    - 異なる市場環境でバランスが取れる
+    # 
+    # 3. 学習時の探索戦略を調整（既に実装済み）
+    #    - Epsilon-greedy: High 35%, Low 35%, Hold 30%
+    # 
+    # 4. 報酬関数の調整
+    #    - High/Lowで完全に対称的な報酬設計（既に実装済み）
     print("\n" + "="*80)
-    print("[INFO] データ拡張を適用 - High/Lowバランス改善")
-    print("="*80)
-    
-    original_len = len(ohlc_df)
-    
-    # オリジナルデータの中心価格を計算
-    center_price = ohlc_df['close'].mean()
-    
-    # 価格を反転させた拡張データを作成
-    augmented_df = ohlc_df.copy()
-    augmented_df['open'] = 2 * center_price - augmented_df['open']
-    augmented_df['high'] = 2 * center_price - augmented_df['low']  # high <-> low を入れ替え
-    augmented_df['low'] = 2 * center_price - ohlc_df['high']
-    augmented_df['close'] = 2 * center_price - augmented_df['close']
-    
-    # インデックスを調整（時間をずらす）
-    if isinstance(augmented_df.index, pd.DatetimeIndex):
-        augmented_df.index = augmented_df.index + pd.Timedelta(days=365*10)  # 10年後にずらす
-    
-    # オリジナルと拡張データを結合
-    ohlc_df = pd.concat([ohlc_df, augmented_df], axis=0)
-    ohlc_df = ohlc_df.sort_index()
-    
-    print(f"[DATA AUGMENTATION] オリジナル: {original_len}行")
-    print(f"[DATA AUGMENTATION] 拡張後: {len(ohlc_df)}行 (2倍)")
-    print(f"[DATA AUGMENTATION] 中心価格: {center_price:.5f}")
-    print(f"[INFO] 価格反転により、Highで有利なパターン → Lowで有利なパターンに変換")
+    print("[INFO] Training data loaded: {} rows".format(len(ohlc_df)))
+    print("[INFO] High/Low balance will be achieved through:")
+    print("  - Balanced exploration (High 35%, Low 35%, Hold 30%)")
+    print("  - Symmetric reward function")
+    print("  - Long-term data covering both uptrends and downtrends")
     print("="*80 + "\n")
 
     # 入力次元を確定（超多くの履歴を使用）
@@ -1203,8 +1196,8 @@ def train_dqn(ohlc_df, pair=pair, save_dir="./Models",
             avg_reward_low = np.mean(reward_stats['Low']) if reward_stats['Low'] else 0.0
             
             # モデル保存（より高速化）
-            torch.save(q.state_dict(), os.path.join(save_dir, f"dqn_policy_{pair}.pt"))
-            with open(os.path.join(save_dir, f"dqn_scaler_{pair}.pkl"), "wb") as f:
+            torch.save(q.state_dict(), os.path.join(save_dir, f"dqn_policy.pt"))
+            with open(os.path.join(save_dir, f"dqn_scaler.pkl"), "wb") as f:
                 pickle.dump(scaler, f)
             print(f"[CKPT] Episode={episode}, Steps={steps}, Eps={eps:.3f}, "
                   f"AvgLoss={avg_loss:.4f}, AvgReward={avg_reward:.4f}")
@@ -1220,8 +1213,8 @@ def train_dqn(ohlc_df, pair=pair, save_dir="./Models",
                 torch.cuda.empty_cache()
 
     # 最終保存
-    torch.save(q.state_dict(), os.path.join(save_dir, f"dqn_policy_{pair}.pt"))
-    with open(os.path.join(save_dir, f"dqn_scaler_{pair}.pkl"), "wb") as f:
+    torch.save(q.state_dict(), os.path.join(save_dir, f"dqn_policy.pt"))
+    with open(os.path.join(save_dir, f"dqn_scaler.pkl"), "wb") as f:
         pickle.dump(scaler, f)
     
     # 最終統計表示
@@ -1369,115 +1362,120 @@ if __name__ == "__main__":
         torch.backends.cudnn.allow_tf32 = True
         print("[INFO] CUDA TF32 acceleration enabled")
     
-    # データファイルのパスを設定
-    data_file = f"data/{pair}_M1.csv"
+    # ====== 複数通貨ペアのデータを統合 ======
+    print("\n" + "="*80)
+    print("[INFO] 複数通貨ペアのデータを読み込んで統合します")
+    print("="*80)
     
-    try:
-        print(f"[INFO] Loading data from {data_file}...")
+    # 使用する通貨ペアリスト
+    currency_pairs = ["USDJPY", "EURUSD", "AUDJPY"]
+    
+    all_dfs = []
+    successful_pairs = []
+    
+    for currency_pair in currency_pairs:
+        data_file = f"data/{currency_pair}_M1.csv"
         
-        # まずデータを読み込んでカラム数を確認
-        df_test = pd.read_csv(data_file, nrows=5)
-        num_columns = len(df_test.columns)
-        
-        print(f"[INFO] Detected {num_columns} columns in the data file")
-        
-        # カラム数に応じて処理を分岐
-        if num_columns >= 7:
-            # 日時カラムあり（date, time, open, high, low, close, volume）
-            print("[INFO] Data format: with date/time columns")
-            column_names = ['date', 'time', 'open', 'high', 'low', 'close', 'volume']
-            df = pd.read_csv(data_file, names=column_names,
-                            dtype={'open': np.float32, 'high': np.float32, 
-                                   'low': np.float32, 'close': np.float32,
-                                   'volume': np.float32})
+        try:
+            print(f"\n[INFO] Loading {currency_pair} from {data_file}...")
             
-            # 日付と時刻を結合してDatetimeIndexを作成
-            df['datetime'] = pd.to_datetime(df['date'] + ' ' + df['time'], format='%Y.%m.%d %H:%M')
-            df = df.set_index('datetime')
-            
-            # 不要な列を削除
-            df = df[['open', 'high', 'low', 'close', 'volume']]
-            
-        elif num_columns >= 5:
-            # 日時カラムなし（open, high, low, close, volume）
-            print("[INFO] Data format: OHLCV only (no date/time columns)")
-            column_names = ['open', 'high', 'low', 'close', 'volume']
-            df = pd.read_csv(data_file, names=column_names,
-                            dtype={'open': np.float32, 'high': np.float32, 
-                                   'low': np.float32, 'close': np.float32,
-                                   'volume': np.float32})
-            
-            # 連番インデックスを使用してDatetimeIndexを生成
-            # 1分足と仮定して、開始時刻から1分ずつ進める
-            from datetime import datetime, timedelta
-            start_time = datetime(2020, 1, 1, 0, 0, 0)
-            df.index = pd.date_range(start=start_time, periods=len(df), freq='1min')
-            print(f"[INFO] Created synthetic datetime index starting from {start_time}")
-            
-        else:
-            raise ValueError(f"Unexpected number of columns: {num_columns}. Expected 5 or 7 columns.")
-        
-        print(f"[INFO] Data loaded: {len(df)} rows")
-        print(f"[INFO] Data range: {df.index[0]} to {df.index[-1]}")
-        print(f"[INFO] Columns: {list(df.columns)}")
-        print(f"[INFO] Sample data:")
-        print(df.head())
-        
-        # 学習開始
-        train_dqn(df, pair=pair)
-        print("[INFO] モデル保存完了")
-        
-    except FileNotFoundError:
-        print(f"[ERROR] データファイルが見つかりません: {data_file}")
-        print("[INFO] 利用可能なデータファイル:")
-        
-        # 利用可能なファイルを表示
-        import glob
-        available_files = glob.glob("data/*_M1.csv")
-        for file in available_files:
-            print(f"  - {file}")
-        
-        if available_files:
-            print(f"\n[INFO] 代替ファイルを使用しますか？最初のファイルを使用: {available_files[0]}")
-            
-            # まずカラム数を確認
-            df_test = pd.read_csv(available_files[0], nrows=5)
+            # まずデータを読み込んでカラム数を確認
+            df_test = pd.read_csv(data_file, nrows=5)
             num_columns = len(df_test.columns)
             
+            # カラム数に応じて処理を分岐
             if num_columns >= 7:
-                # 日時カラムあり
+                # 日時カラムあり（date, time, open, high, low, close, volume）
                 column_names = ['date', 'time', 'open', 'high', 'low', 'close', 'volume']
-                df = pd.read_csv(available_files[0], names=column_names,
-                               dtype={'open': np.float32, 'high': np.float32, 
-                                      'low': np.float32, 'close': np.float32,
-                                      'volume': np.float32})
+                df = pd.read_csv(data_file, names=column_names,
+                                dtype={'open': np.float32, 'high': np.float32, 
+                                       'low': np.float32, 'close': np.float32,
+                                       'volume': np.float32})
+                
+                # 日付と時刻を結合してDatetimeIndexを作成
                 df['datetime'] = pd.to_datetime(df['date'] + ' ' + df['time'], format='%Y.%m.%d %H:%M')
                 df = df.set_index('datetime')
+                
+                # 不要な列を削除
                 df = df[['open', 'high', 'low', 'close', 'volume']]
+                
             elif num_columns >= 5:
-                # 日時カラムなし
+                # 日時カラムなし（open, high, low, close, volume）
                 column_names = ['open', 'high', 'low', 'close', 'volume']
-                df = pd.read_csv(available_files[0], names=column_names,
-                               dtype={'open': np.float32, 'high': np.float32, 
-                                      'low': np.float32, 'close': np.float32,
-                                      'volume': np.float32})
+                df = pd.read_csv(data_file, names=column_names,
+                                dtype={'open': np.float32, 'high': np.float32, 
+                                       'low': np.float32, 'close': np.float32,
+                                       'volume': np.float32})
+                
+                # 連番インデックスを使用してDatetimeIndexを生成
                 from datetime import datetime, timedelta
-                start_time = datetime(2020, 1, 1, 0, 0, 0)
+                # 通貨ペアごとに異なる開始時刻を設定（データ重複を避ける）
+                pair_offset = len(all_dfs) * 365  # 1年ずつずらす
+                start_time = datetime(2020, 1, 1, 0, 0, 0) + timedelta(days=pair_offset)
                 df.index = pd.date_range(start=start_time, periods=len(df), freq='1min')
-                print(f"[INFO] Created synthetic datetime index")
+                
             else:
-                raise ValueError(f"Unexpected columns: {num_columns}")
+                print(f"[WARN] {currency_pair}: Unexpected number of columns: {num_columns}. Skipping.")
+                continue
             
-            pair_from_file = available_files[0].split('\\')[-1].split('_')[0]  # Windowsパス区切り対応
-            print(f"[INFO] ペア名を {pair_from_file} に変更")
-            train_dqn(df, pair=pair_from_file)
-            print("[INFO] モデル保存完了")
-        else:
-            print("[ERROR] M1データファイルが見つかりません")
-            sys.exit(1)
+            # 価格を正規化（通貨ペア間の価格差を吸収）
+            # 各通貨ペアの平均価格で正規化
+            price_mean = df['close'].mean()
+            df['open'] = df['open'] / price_mean
+            df['high'] = df['high'] / price_mean
+            df['low'] = df['low'] / price_mean
+            df['close'] = df['close'] / price_mean
             
+            print(f"[SUCCESS] {currency_pair}: {len(df)} rows loaded and normalized")
+            print(f"  Date range: {df.index[0]} to {df.index[-1]}")
+            print(f"  Price mean: {price_mean:.5f} (normalized to 1.0)")
+            
+            all_dfs.append(df)
+            successful_pairs.append(currency_pair)
+            
+        except FileNotFoundError:
+            print(f"[WARN] {currency_pair}: File not found: {data_file}")
+        except Exception as e:
+            print(f"[ERROR] {currency_pair}: Error loading data: {e}")
+    
+    # データの統合
+    if not all_dfs:
+        print("\n[ERROR] 利用可能なデータがありません。終了します。")
+        import glob
+        available_files = glob.glob("data/*_M1.csv")
+        print("[INFO] 利用可能なファイル:")
+        for file in available_files:
+            print(f"  - {file}")
+        sys.exit(1)
+    
+    print("\n" + "="*80)
+    print(f"[INFO] データ統合: {len(successful_pairs)}通貨ペア ({', '.join(successful_pairs)})")
+    print("="*80)
+    
+    # すべてのデータフレームを結合
+    df = pd.concat(all_dfs, axis=0)
+    df = df.sort_index()
+    
+    print(f"[INFO] 統合後のデータ: {len(df)} rows")
+    print(f"[INFO] Date range: {df.index[0]} to {df.index[-1]}")
+    print(f"[INFO] Sample data:")
+    print(df.head())
+    
+    print("\n[INFO] 統合データの統計:")
+    print(df.describe())
+    
+    # モデル名は統合ペア名にする
+    model_pair_name = "_".join(successful_pairs) if len(successful_pairs) > 1 else successful_pairs[0]
+    
+    print(f"\n[INFO] モデル名: {model_pair_name}")
+    print("="*80 + "\n")
+    
+    # 学習開始
+    try:
+        train_dqn(df, pair=model_pair_name)
+        print("[INFO] モデル保存完了")
     except Exception as e:
-        print(f"[ERROR] データ読み込みエラー: {e}")
+        print(f"[ERROR] 学習中にエラーが発生しました: {e}")
         import traceback
         traceback.print_exc()
-        sys.exit(1)
+

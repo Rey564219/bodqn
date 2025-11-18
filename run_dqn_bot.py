@@ -120,9 +120,25 @@ import torch.nn.functional as F
 # -----------------------
 # 設定
 # -----------------------
-pair = "USDJPY"  # BTCUSDからUSDJPYに変更
-MODEL_PT = f"./Models/dqn_policy_{pair}.pt"  # train_dqn.pyの保存形式に合わせる
-MODEL_PKL = f"./Models/dqn_scaler_{pair}.pkl"  # スケーラーファイルも追加
+# 複数通貨ペアで学習したモデルを使用する場合は、モデル名を変更
+# 例: "USDJPY_EURUSD_AUDJPY" (train_dqn.pyで生成されたモデル名)
+pair = "USDJPY_EURUSD_AUDJPY"  # 複数通貨ペアモデル、または単一通貨ペア
+
+# モデルファイルの存在確認と自動選択
+import glob
+model_files = glob.glob("./Models/dqn_policy_*.pt")
+if model_files:
+    # 最新のモデルファイルを使用
+    latest_model = max(model_files, key=os.path.getmtime)
+    pair = os.path.basename(latest_model).replace("dqn_policy_", "").replace(".pt", "")
+    print(f"[INFO] 検出されたモデル: {pair}")
+else:
+    # デフォルトモデル
+    pair = "USDJPY"
+    print(f"[WARN] モデルが見つかりません。デフォルト: {pair}")
+
+MODEL_PT = f"./Models/dqn_policy_{pair}.pt"
+MODEL_PKL = f"./Models/dqn_scaler_{pair}.pkl"
 TICK_INTERVAL_SECONDS = 0.5
 CANDLE_TIMEFRAME = '1min'
 REQUIRED_CANDLES = 12
