@@ -41,431 +41,18 @@ torch.backends.cudnn.deterministic = False  # 速度優先
 from collections import deque
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
-import pandas as pd
-import talib as ta
-import numpy as np
-from functools import lru_cache
 import torch.nn.functional as F
 from concurrent.futures import ThreadPoolExecutor
 import multiprocessing as mp
 
+from shared_features import (
+    FeatureExtraction,
+    build_state_vec,
+    build_state_vec_fast,
+    clear_feature_cache,
+)
+
 pair = "USDJPY"
-def _CalcSMAR(df,periods):
-    sma_features = {}
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        for period in periods:
-            ema = ta.EMA(df["close"], period)
-            # ゼロ除算を防ぐ（安全な除算）
-            close_vals = df["close"].values
-            ema_vals = ema.values if hasattr(ema, 'values') else ema
-            safe_mask = (close_vals != 0) & np.isfinite(close_vals) & np.isfinite(ema_vals)
-            sma_features["SMAR_"+str(period)] = np.where(safe_mask, 
-                                                       np.divide(ema_vals, close_vals, out=np.ones_like(close_vals), where=safe_mask), 1.0)
-    
-    # 一度にすべての列を追加
-    if sma_features:
-        sma_df = pd.DataFrame(sma_features, index=df.index)
-        df = pd.concat([df, sma_df], axis=1)
-    
-    return df
-
-def _CalcRSIR(df,periods):
-    rsi_features = {}
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        for period in periods:
-            rsi_val = ta.RSI(df["close"], period)
-            rsi_features["RSIR_"+str(period)] = rsi_val
-            rsi_features["RSIR_diff_"+str(period)] = rsi_val.diff()
-    
-    # 一度にすべての列を追加
-    if rsi_features:
-        rsi_df = pd.DataFrame(rsi_features, index=df.index)
-        df = pd.concat([df, rsi_df], axis=1)
-    
-    return df
-def _CalcOtherR(df, periods):
-    # 警告を抑制
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        
-        # 大量データの場合、計算する期間を制限
-        if len(df) > 100:
-            # 最後の部分のみ計算（効率化）
-            calc_df = df.iloc[-min(500, len(df)):].copy()  # 最大500行まで
-            
-            other_features = {}
-            
-            for period in periods:
-                if len(calc_df) < period:
-                    continue  # 期間が不足している場合はスキップ
-                    
-                # ボリンジャーバンド幅
-                try:
-                    upper, middle, lower = ta.BBANDS(calc_df['close'], period)
-                    bb_width = upper - lower
-                    other_features[f'bb_width{period}'] = bb_width
-                    other_features[f'bb_width_diff{period}'] = bb_width.diff()
-                    
-                    # ボリンジャーバンドの位置（%B）- ゼロ除算防止
-                    width = upper - lower
-                    safe_width = np.where((width != 0) & np.isfinite(width), width, 1.0)
-                    other_features[f'bb_percent{period}'] = np.where(safe_width != 1.0, (calc_df['close'] - lower) / safe_width, 0.5)
-                    
-                    # ATR（平均的な値幅）
-                    atr_val = ta.ATR(calc_df['high'], calc_df['low'], calc_df['close'], period)
-                    other_features[f'atr{period}'] = atr_val
-                    other_features[f'atr_diff{period}'] = atr_val.diff()
-                    
-                    # 価格変動率 - 異常値防止
-                    other_features[f'price_change{period}'] = calc_df['close'].pct_change(period).clip(-1, 1)
-                    
-                    # ボラティリティ
-                    other_features[f'volatility{period}'] = calc_df['close'].rolling(period).std()
-                    
-                    # 新しい特徴量：価格の勢い（軽量版）
-                    momentum_val = ta.MOM(calc_df['close'], period)
-                    other_features[f'momentum{period}'] = momentum_val
-                    close_vals = calc_df['close'].values
-                    momentum_vals = momentum_val.values if hasattr(momentum_val, 'values') else momentum_val
-                    safe_close = np.where((close_vals != 0) & np.isfinite(close_vals), close_vals, 1.0)
-                    other_features[f'momentum_norm{period}'] = np.divide(momentum_vals, safe_close, out=np.zeros_like(momentum_vals), where=safe_close != 1.0)
-                    
-                    # 価格の位置（高値・安値に対する相対位置）
-                    high_max = calc_df['high'].rolling(period).max()
-                    low_min = calc_df['low'].rolling(period).min()
-                    range_diff = high_max - low_min + 1e-8
-                    other_features[f'high_pos{period}'] = (calc_df['close'] - low_min) / range_diff
-                    
-                except Exception as e:
-                    print(f"[WARNING] Error calculating period {period}: {e}")
-                    continue
-            
-            # 新しい列を一度に追加
-            if other_features:
-                other_df = pd.DataFrame(other_features, index=calc_df.index)
-                calc_df = pd.concat([calc_df, other_df], axis=1)
-            
-            # 元のデータフレームに結果を統合（最後の行のみ）
-            for col in calc_df.columns:
-                if col not in df.columns:
-                    df[col] = np.nan
-                    df.iloc[-1, df.columns.get_loc(col)] = calc_df.iloc[-1][col]
-        else:
-            # 小さなデータの場合は通常の計算
-            other_features = {}
-            
-            for period in periods:
-                if len(df) < period:
-                    continue
-                    
-                # ボリンジャーバンド幅
-                upper, middle, lower = ta.BBANDS(df['close'], period)
-                bb_width = upper - lower
-                other_features[f'bb_width{period}'] = bb_width
-                other_features[f'bb_width_diff{period}'] = bb_width.diff()
-                
-                # ボリンジャーバンドの位置（%B）- ゼロ除算防止
-                width = upper - lower
-                safe_width = np.where((width != 0) & np.isfinite(width), width, 1.0)
-                other_features[f'bb_percent{period}'] = np.where(safe_width != 1.0, (df['close'] - lower) / safe_width, 0.5)
-                
-                # ATR（平均的な値幅）
-                atr_val = ta.ATR(df['high'], df['low'], df['close'], period)
-                other_features[f'atr{period}'] = atr_val
-                other_features[f'atr_diff{period}'] = atr_val.diff()
-                
-                # 価格変動率 - 異常値防止
-                other_features[f'price_change{period}'] = df['close'].pct_change(period).clip(-1, 1)
-                
-                # ボラティリティ
-                other_features[f'volatility{period}'] = df['close'].rolling(period).std()
-                
-                # 新しい特徴量：価格の勢い
-                momentum_val = ta.MOM(df['close'], period)
-                other_features[f'momentum{period}'] = momentum_val
-                close_vals = df['close'].values
-                momentum_vals = momentum_val.values if hasattr(momentum_val, 'values') else momentum_val
-                safe_close = np.where((close_vals != 0) & np.isfinite(close_vals), close_vals, 1.0)
-                other_features[f'momentum_norm{period}'] = np.divide(momentum_vals, safe_close, out=np.zeros_like(momentum_vals), where=safe_close != 1.0)
-                
-                # 価格の位置（高値・安値に対する相対位置）
-                high_max = df['high'].rolling(period).max()
-                low_min = df['low'].rolling(period).min()
-                range_diff = high_max - low_min + 1e-8
-                other_features[f'high_pos{period}'] = (df['close'] - low_min) / range_diff
-            
-            # 新しい列を一度に追加
-            if other_features:
-                other_df = pd.DataFrame(other_features, index=df.index)
-                df = pd.concat([df, other_df], axis=1)
-    
-    # より軽量な技術指標のみ計算
-    additional_features = {}
-    try:
-        # ストキャスティクス（期間を固定）
-        period = 14
-        slowk, slowd = ta.STOCH(df['high'], df['low'], df['close'], period)
-        additional_features['slowk'] = slowk
-        additional_features['slowk_diff'] = slowk.diff()
-        additional_features['slowd'] = slowd
-        additional_features['slowd_diff'] = slowd.diff()
-        
-        # MACD
-        macd, macdsignal, macdhist = ta.MACD(df['close'])
-        additional_features['macd'] = macd
-        additional_features['macd_signal'] = macdsignal
-        additional_features['macd_hist'] = macdhist
-        additional_features['macd_cross'] = np.where(macd > macdsignal, 1, -1)  # MACDクロス
-        
-        # Williams %R
-        additional_features['williams_r'] = ta.WILLR(df['high'], df['low'], df['close'])
-        
-        # CCI (Commodity Channel Index)
-        additional_features['cci'] = ta.CCI(df['high'], df['low'], df['close'])
-        
-        # ROC (Rate of Change)
-        additional_features['roc'] = ta.ROC(df['close'])
-        
-        # 一度にすべての追加特徴量を追加
-        additional_df = pd.DataFrame(additional_features, index=df.index)
-        df = pd.concat([df, additional_df], axis=1)
-        
-    except Exception as e:
-        print(f"[WARNING] Error in additional indicators: {e}")
-    
-    # 全ての列でNaNと無限大を処理（警告抑制）
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        for col in df.columns:
-            if df[col].dtype in ['float64', 'float32']:
-                df[col] = df[col].replace([np.inf, -np.inf], np.nan)
-                df[col] = df[col].ffill().fillna(0)  # 新しい記法に変更
-    
-    return df.copy()  # 断片化を防ぐためにcopy()を追加
-
-# 特徴量計算のキャッシュを最適化
-_feature_cache = {}
-
-@lru_cache(maxsize=1000)  # LRUキャッシュを追加
-def get_cached_ta_function(func_name, period):
-    """TALib関数のキャッシュ化"""
-    return getattr(ta, func_name)
-
-def FeatureExtraction(df, use_cache=True):
-    if use_cache:
-        # より効率的なハッシュ計算
-        df_hash = hash((tuple(df.iloc[-1].values), len(df)))
-        if df_hash in _feature_cache:
-            return _feature_cache[df_hash]
-    
-    # メモリ効率を向上させるためにinplace操作を活用
-    df = df.copy()
-    
-    # より多くの期間で多角的に分析
-    periods_RSI = [7, 14, 21, 28]  # RSI期間を拡大
-    periods_SMA = [5, 10, 20, 50, 100]  # より多くのSMA期間
-
-    # 並列処理で特徴量計算を高速化
-    with ThreadPoolExecutor(max_workers=min(4, os.cpu_count())) as executor:
-        future_sma = executor.submit(_CalcSMAR, df, periods_SMA)
-        future_rsi = executor.submit(_CalcRSIR, df, periods_RSI)
-        future_other = executor.submit(_CalcOtherR, df, periods_RSI)
-        
-        # 結果を取得
-        df = future_sma.result()
-        df = future_rsi.result()
-        df = future_other.result()
-
-    # 基本的な価格比率と高度な価格パターン特徴量を効率的に計算
-    # NumPy演算を使用してベクトル化計算（警告対策強化）
-    close = df["close"].values
-    open_vals = df["open"].values
-    high = df["high"].values
-    low = df["low"].values
-    
-    basic_features = {}
-    
-    # ゼロ除算防止のマスク（より厳密）
-    close_nonzero = (close != 0) & np.isfinite(close)
-    basic_features["open_r"] = np.where(close_nonzero, np.divide(open_vals, close, out=np.ones_like(close), where=close_nonzero), 1.0)
-    basic_features["high_r"] = np.where(close_nonzero, np.divide(high, close, out=np.ones_like(close), where=close_nonzero), 1.0)
-    basic_features["low_r"] = np.where(close_nonzero, np.divide(low, close, out=np.ones_like(close), where=close_nonzero), 1.0)
-    
-    # 高度な価格パターン特徴量（ベクトル化、警告対策）
-    hl_diff = high - low
-    oc_diff = open_vals - close
-    hl_nonzero = (hl_diff != 0) & np.isfinite(hl_diff)
-    
-    basic_features["hl_ratio"] = np.where(close_nonzero, np.divide(hl_diff, close, out=np.zeros_like(close), where=close_nonzero), 0.0)
-    basic_features["oc_ratio"] = np.where(close_nonzero, np.divide(oc_diff, close, out=np.zeros_like(close), where=close_nonzero), 0.0)
-    basic_features["body_ratio"] = np.where(hl_nonzero, np.divide(np.abs(oc_diff), hl_diff, out=np.zeros_like(hl_diff), where=hl_nonzero), 0.0)
-    
-    # 影の計算（最適化、警告対策強化）
-    max_oc = np.maximum(open_vals, close)
-    min_oc = np.minimum(open_vals, close)
-    basic_features["upper_shadow"] = np.where(hl_nonzero, np.divide(high - max_oc, hl_diff, out=np.zeros_like(hl_diff), where=hl_nonzero), 0.0)
-    basic_features["lower_shadow"] = np.where(hl_nonzero, np.divide(min_oc - low, hl_diff, out=np.zeros_like(hl_diff), where=hl_nonzero), 0.0)
-    
-    # 一度にすべての基本特徴量を追加
-    basic_df = pd.DataFrame(basic_features, index=df.index)
-    df = pd.concat([df, basic_df], axis=1)
-    
-    # 価格の勢い特徴量（複数時間軸）を効率的に計算
-    momentum_features = {}
-    for period in [3, 5, 10, 20]:
-        if len(df) >= period:
-            momentum_features[f"momentum_{period}"] = df["close"].pct_change(period).fillna(0)
-            momentum_features[f"volatility_{period}"] = df["close"].rolling(period).std().fillna(0)
-            momentum_features[f"volume_price_trend_{period}"] = (df["close"].diff() * df.get("volume", 1)).rolling(period).sum().fillna(0)
-    
-    if momentum_features:
-        momentum_df = pd.DataFrame(momentum_features, index=df.index)
-        df = pd.concat([df, momentum_df], axis=1)
-    
-    # 移動平均との関係 - 多角的分析を効率的に計算
-    ma_features = {}
-    for period in [3, 5, 10, 20, 50, 100]:
-        if len(df) >= period:
-            sma = df["close"].rolling(period).mean()
-            ema = df["close"].ewm(span=period).mean()
-            wma = df["close"].rolling(period).apply(lambda x: np.average(x, weights=range(1, len(x)+1)), raw=True)
-            
-            ma_features[f"sma_distance_{period}"] = np.where(sma != 0, (df["close"] - sma) / sma, 0.0)
-            ma_features[f"ema_distance_{period}"] = np.where(ema != 0, (df["close"] - ema) / ema, 0.0)
-            ma_features[f"wma_distance_{period}"] = np.where(wma != 0, (df["close"] - wma) / wma, 0.0)
-            ma_features[f"sma_ema_diff_{period}"] = np.where(ema != 0, (sma - ema) / ema, 0.0)
-            
-            # 移動平均の傾き
-            ma_features[f"sma_slope_{period}"] = sma.diff().fillna(0)
-            ma_features[f"ema_slope_{period}"] = ema.diff().fillna(0)
-    
-    if ma_features:
-        ma_df = pd.DataFrame(ma_features, index=df.index)
-        df = pd.concat([df, ma_df], axis=1)
-    
-    # 価格と移動平均の交差シグナル（複数組み合わせ）を効率的に計算
-    cross_features = {}
-    for fast, slow in [(5, 20), (10, 50), (20, 100)]:
-        if len(df) >= slow:
-            sma_fast = df["close"].rolling(fast).mean()
-            sma_slow = df["close"].rolling(slow).mean()
-            cross_features[f"golden_cross_{fast}_{slow}"] = np.where(sma_fast > sma_slow, 1, 0)
-            cross_features[f"death_cross_{fast}_{slow}"] = np.where(sma_fast < sma_slow, 1, 0)
-            cross_features[f"ma_convergence_{fast}_{slow}"] = np.where(sma_slow != 0, (sma_fast - sma_slow) / sma_slow, 0.0)
-    
-    if cross_features:
-        cross_df = pd.DataFrame(cross_features, index=df.index)
-        df = pd.concat([df, cross_df], axis=1)
-    
-    # RSIベースの強力な特徴量を効率的に計算
-    rsi_features = {}
-    for period in periods_RSI:
-        rsi_col = f"RSIR_{period}"
-        if rsi_col in df.columns:
-            rsi_features[f"rsi_overbought_{period}"] = np.where(df[rsi_col] > 70, 1, 0)
-            rsi_features[f"rsi_oversold_{period}"] = np.where(df[rsi_col] < 30, 1, 0)
-            rsi_features[f"rsi_neutral_{period}"] = np.where((df[rsi_col] >= 40) & (df[rsi_col] <= 60), 1, 0)
-            rsi_features[f"rsi_momentum_{period}"] = df[rsi_col].diff().fillna(0)
-    
-    if rsi_features:
-        rsi_df = pd.DataFrame(rsi_features, index=df.index)
-        df = pd.concat([df, rsi_df], axis=1)
-    
-    # ボリンジャーバンド関連特徴量を効率的に計算
-    bb_features = {}
-    for period in [10, 20]:
-        if len(df) >= period:
-            sma = df["close"].rolling(period).mean()
-            std = df["close"].rolling(period).std()
-            upper_band = sma + (std * 2)
-            lower_band = sma - (std * 2)
-            
-            bb_position = np.where(std != 0, (df["close"] - sma) / (2 * std), 0.0)
-            bb_width = np.where(sma != 0, (upper_band - lower_band) / sma, 0.0)
-            
-            bb_features[f"bb_position_{period}"] = bb_position
-            bb_features[f"bb_width_{period}"] = bb_width
-            bb_features[f"bb_squeeze_{period}"] = np.where(bb_width < pd.Series(bb_width).rolling(10).mean(), 1, 0)
-    
-    if bb_features:
-        bb_df = pd.DataFrame(bb_features, index=df.index)
-        df = pd.concat([df, bb_df], axis=1)
-    
-    # 高度なパターン認識と連続パターンを効率的に計算
-    pattern_features = {}
-    
-    # ピンバー検出
-    pattern_features["pin_bar_bull"] = np.where(
-        (df["lower_shadow"] > 0.6) & (df["body_ratio"] < 0.3) & (df["upper_shadow"] < 0.3), 1, 0
-    )
-    pattern_features["pin_bar_bear"] = np.where(
-        (df["upper_shadow"] > 0.6) & (df["body_ratio"] < 0.3) & (df["lower_shadow"] < 0.3), 1, 0
-    )
-    
-    # ドジパターン
-    pattern_features["doji"] = np.where(df["body_ratio"] < 0.1, 1, 0)
-    
-    # 連続パターン
-    bullish_candle = np.where(df["close"] > df["open"], 1, 0)
-    bearish_candle = np.where(df["close"] < df["open"], 1, 0)
-    
-    pattern_features["bullish_candle"] = bullish_candle
-    pattern_features["bearish_candle"] = bearish_candle
-    pattern_features["consecutive_bull"] = pd.Series(bullish_candle, index=df.index).rolling(3).sum()
-    pattern_features["consecutive_bear"] = pd.Series(bearish_candle, index=df.index).rolling(3).sum()
-    
-    # 前の足との比較 - 異常値クリップ
-    pattern_features["prev_close_ratio"] = df["close"].pct_change().clip(-1, 1)
-    pattern_features["prev_volume_ratio"] = df["volume"].pct_change().clip(-10, 10) if "volume" in df.columns else 0
-    
-    # 一度にすべてのパターン特徴量を追加
-    pattern_df = pd.DataFrame(pattern_features, index=df.index)
-    df = pd.concat([df, pattern_df], axis=1)
-    
-    # 複数期間の価格変化率とブレイクアウトシグナルを効率的に計算
-    new_columns = {}
-    
-    # 複数期間の価格変化率
-    for lookback in [2, 3, 5]:
-        new_columns[f"price_change_{lookback}"] = df["close"].pct_change(lookback).clip(-1, 1)
-    
-    # 高値・安値のブレイクアウトシグナル
-    for period in [10, 20]:
-        new_columns[f"high_breakout_{period}"] = (df["high"] > df["high"].rolling(period).max().shift(1)).astype(int)
-        new_columns[f"low_breakout_{period}"] = (df["low"] < df["low"].rolling(period).min().shift(1)).astype(int)
-    
-    # 一度にすべての新しい列を追加
-    new_df = pd.DataFrame(new_columns, index=df.index)
-    df = pd.concat([df, new_df], axis=1)
-    
-    result = df.drop(columns = ["open", "close", "high", "low", "volume"], errors='ignore')
-    
-    # 異常値処理
-    result = result.replace([np.inf, -np.inf], np.nan)  # 無限大をNaNに変換
-    result = result.fillna(0)  # NaNを0で埋める
-    
-    # 異常に大きな値をクリップ
-    numeric_columns = result.select_dtypes(include=[np.number]).columns
-    for col in numeric_columns:
-        # 99.9%分位点でクリップ
-        upper_limit = result[col].quantile(0.999)
-        lower_limit = result[col].quantile(0.001)
-        result[col] = result[col].clip(lower=lower_limit, upper=upper_limit)
-    
-    if use_cache:
-        _feature_cache[df_hash] = result.copy()  # copy()を使って断片化を防ぐ
-        # キャッシュサイズ制限（メモリ効率化）
-        if len(_feature_cache) > 5000:  # 10000→5000に削減
-            # 古いキャッシュを削除（複数削除）
-            keys_to_remove = list(_feature_cache.keys())[:1000]
-            for key in keys_to_remove:
-                del _feature_cache[key]
-            gc.collect()  # ガベージコレクション実行
-    
-    # DataFrameの断片化を解決するために新しいコピーを作成
-    return result.copy()
 ACTIONS = 3  # 0:Hold, 1:High, 2:Low
 
 class QNet(nn.Module):
@@ -674,22 +261,6 @@ class Replay:
     
     def __len__(self): return len(self.buf)
 
-def build_state_vec(ohlc_win_df, extra=None, use_cache=True):
-    feat = FeatureExtraction(ohlc_win_df, use_cache=use_cache)[-1:]
-    x = feat.values.astype(np.float32).reshape(-1)  # 明示的にfloat32に変換
-    if extra is not None:
-        x = np.concatenate([x, np.asarray(extra, dtype=np.float32)])
-    return x.astype(np.float32)  # 確実にfloat32にする
-
-def build_state_vec_fast(ohlc_slice, phase, sec_range):
-    """高速版の状態ベクトル構築（メモリ効率最適化）"""
-    # インプレース操作でメモリ使用量を削減
-    feat = FeatureExtraction(ohlc_slice, use_cache=False)
-    x = feat.iloc[-1].values.astype(np.float32)
-    # NumPyの効率的な連結
-    extra_features = np.array([phase, sec_range], dtype=np.float32)
-    return np.concatenate([x, extra_features])
-
 # バッチ処理用の関数を追加（並列化対応）
 def build_state_batch_parallel(ohlc_data_list, extra_list=None, n_workers=None):
     """並列処理で複数の状態ベクトルを高速処理"""
@@ -751,7 +322,12 @@ def compute_reward(entry_action, next_close, entry_price, market_context=None):
         # 小さな勝ちでも高く評価する追加ボーナス
         consistency_bonus = 5.0
         
-        total_reward = base_reward + certainty_bonus + win_rate_bonus + consistency_bonus
+        # Low予測の場合、ボーナスを20%増加（High/Lowバランス調整）
+        if entry_action == 2:  # Low
+            low_balance_bonus = (base_reward + certainty_bonus + win_rate_bonus + consistency_bonus) * 0.15
+            total_reward = base_reward + certainty_bonus + win_rate_bonus + consistency_bonus + low_balance_bonus
+        else:  # High
+            total_reward = base_reward + certainty_bonus + win_rate_bonus + consistency_bonus
         
         # 最低でも20.0の報酬を保証
         return max(total_reward, 20.0)
@@ -785,7 +361,23 @@ def train_dqn(ohlc_df, pair=pair, save_dir="./Models",
               epsilon_start=0.99, epsilon_end=0.001, epsilon_decay=100000,  # 超慎重探索
               device='cuda' if torch.cuda.is_available() else 'cpu',
               num_workers=2, max_time_hours=8):  # 80%勝率確実達成のための学習時間
+    
+    # 保存ディレクトリを確実に作成（絶対パスで）
+    import os
+    save_dir = os.path.abspath(save_dir)
     os.makedirs(save_dir, exist_ok=True)
+    print(f"[INFO] Save directory: {save_dir}")
+    
+    # 書き込みテスト
+    test_file = os.path.join(save_dir, "test_write.tmp")
+    try:
+        with open(test_file, "w") as f:
+            f.write("test")
+        os.remove(test_file)
+        print(f"[INFO] Write permission confirmed")
+    except Exception as e:
+        print(f"[ERROR] Cannot write to {save_dir}: {e}")
+        raise
 
     print(f"[INFO] Using device: {device}")
     
@@ -796,11 +388,8 @@ def train_dqn(ohlc_df, pair=pair, save_dir="./Models",
     
     ohlc_df = ohlc_df[['open','high','low','close']].copy()
     
-    # データサイズを超最大化（80%勝率確実達成のための全データ活用）
-    max_data_points = 150000  # 超大幅にデータサイズを拡大
-    if len(ohlc_df) > max_data_points:
-        print(f"[INFO] Data too large ({len(ohlc_df)} rows), using last {max_data_points} rows")
-        ohlc_df = ohlc_df.iloc[-max_data_points:].copy()
+    # 全データを使用（上限なし）
+    print(f"[INFO] Using all {len(ohlc_df)} rows for training")
     
     # DatetimeIndexの確認（なければ作成）
     if not isinstance(ohlc_df.index, pd.DatetimeIndex):
@@ -1196,8 +785,8 @@ def train_dqn(ohlc_df, pair=pair, save_dir="./Models",
             avg_reward_low = np.mean(reward_stats['Low']) if reward_stats['Low'] else 0.0
             
             # モデル保存（より高速化）
-            torch.save(q.state_dict(), os.path.join(save_dir, f"dqn_policy.pt"))
-            with open(os.path.join(save_dir, f"dqn_scaler.pkl"), "wb") as f:
+            torch.save(q.state_dict(), os.path.join(save_dir, "dqn_policy.pt"))
+            with open(os.path.join(save_dir, "dqn_scaler.pkl"), "wb") as f:
                 pickle.dump(scaler, f)
             print(f"[CKPT] Episode={episode}, Steps={steps}, Eps={eps:.3f}, "
                   f"AvgLoss={avg_loss:.4f}, AvgReward={avg_reward:.4f}")
@@ -1213,8 +802,8 @@ def train_dqn(ohlc_df, pair=pair, save_dir="./Models",
                 torch.cuda.empty_cache()
 
     # 最終保存
-    torch.save(q.state_dict(), os.path.join(save_dir, f"dqn_policy.pt"))
-    with open(os.path.join(save_dir, f"dqn_scaler.pkl"), "wb") as f:
+    torch.save(q.state_dict(), os.path.join(save_dir, "dqn_policy.pt"))
+    with open(os.path.join(save_dir, "dqn_scaler.pkl"), "wb") as f:
         pickle.dump(scaler, f)
     
     # 最終統計表示
@@ -1237,8 +826,7 @@ def train_dqn(ohlc_df, pair=pair, save_dir="./Models",
         print("="*60)
     
     # キャッシュクリア
-    global _feature_cache
-    _feature_cache.clear()
+    clear_feature_cache()
     
     print("[DONE] DQN training completed and saved.")
     evaluate_dqn_model(q, scaler, ohlc_df, device=device, window_size=window_size)

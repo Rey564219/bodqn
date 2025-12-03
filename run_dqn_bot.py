@@ -26,88 +26,7 @@ import pandas as pd
 from datetime import datetime, timedelta
 from collections import deque
 
-# TA-lib (必要)
-ta = None
-try:
-    import talib as ta
-    print("[INFO] TA-lib (talib) loaded successfully")
-except ImportError:
-    try:
-        import ta
-        print("[INFO] TA-lib alternative (ta) loaded successfully")
-    except ImportError:
-        print("[WARN] TA-lib not available. Using basic calculations...")
-        # TA-lib関数のモック版を作成
-        class MockTA:
-            @staticmethod
-            def EMA(close, period):
-                return close.ewm(span=period).mean()
-            
-            @staticmethod
-            def RSI(close, period):
-                delta = close.diff()
-                gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-                loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-                rs = gain / loss
-                return 100 - (100 / (1 + rs))
-            
-            @staticmethod
-            def BBANDS(close, period, nbdevup=2, nbdevdn=2, matype=0):
-                ma = close.rolling(period).mean()
-                std = close.rolling(period).std()
-                upper = ma + (std * nbdevup)
-                lower = ma - (std * nbdevdn)
-                return upper, ma, lower
-                
-            @staticmethod
-            def ATR(high, low, close, period):
-                tr1 = high - low
-                tr2 = abs(high - close.shift())
-                tr3 = abs(low - close.shift())
-                tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-                return tr.rolling(period).mean()
-                
-            @staticmethod
-            def MOM(close, period):
-                return close.diff(period)
-                
-            @staticmethod
-            def STOCH(high, low, close, period):
-                lowest_low = low.rolling(period).min()
-                highest_high = high.rolling(period).max()
-                k_percent = 100 * ((close - lowest_low) / (highest_high - lowest_low))
-                d_percent = k_percent.rolling(3).mean()
-                return k_percent, d_percent
-                
-            @staticmethod
-            def MACD(close, fastperiod=12, slowperiod=26, signalperiod=9):
-                exp1 = close.ewm(span=fastperiod).mean()
-                exp2 = close.ewm(span=slowperiod).mean()
-                macd = exp1 - exp2
-                signal = macd.ewm(span=signalperiod).mean()
-                histogram = macd - signal
-                return macd, signal, histogram
-                
-            @staticmethod
-            def WILLR(high, low, close, period):
-                highest_high = high.rolling(period).max()
-                lowest_low = low.rolling(period).min()
-                wr = -100 * ((highest_high - close) / (highest_high - lowest_low))
-                return wr
-                
-            @staticmethod
-            def CCI(high, low, close, period):
-                tp = (high + low + close) / 3
-                sma = tp.rolling(period).mean()
-                mad = tp.rolling(period).apply(lambda x: abs(x - x.mean()).mean())
-                cci = (tp - sma) / (0.015 * mad)
-                return cci
-                
-            @staticmethod
-            def ROC(close, period=10):
-                return ((close - close.shift(period)) / close.shift(period)) * 100
-        
-        ta = MockTA()
+from shared_features import build_state_vec_fast
 
 # Playwright
 from playwright.sync_api import sync_playwright
@@ -120,28 +39,21 @@ import torch.nn.functional as F
 # -----------------------
 # 設定
 # -----------------------
-# 複数通貨ペアで学習したモデルを使用する場合は、モデル名を変更
-# 例: "USDJPY_EURUSD_AUDJPY" (train_dqn.pyで生成されたモデル名)
-pair = "USDJPY_EURUSD_AUDJPY"  # 複数通貨ペアモデル、または単一通貨ペア
+# 複数通貨ペアで学習した統合モデルを使用
+# モデルファイル名は固定: dqn_policy.pt / dqn_scaler.pkl
+MODEL_PT = "./Models/dqn_policy.pt"
+MODEL_PKL = "./Models/dqn_scaler.pkl"
 
-# モデルファイルの存在確認と自動選択
-import glob
-model_files = glob.glob("./Models/dqn_policy_*.pt")
-if model_files:
-    # 最新のモデルファイルを使用
-    latest_model = max(model_files, key=os.path.getmtime)
-    pair = os.path.basename(latest_model).replace("dqn_policy_", "").replace(".pt", "")
-    print(f"[INFO] 検出されたモデル: {pair}")
+# モデルファイルの存在確認
+if os.path.exists(MODEL_PT):
+    print(f"[INFO] 統合モデルを使用: {MODEL_PT}")
 else:
-    # デフォルトモデル
-    pair = "USDJPY"
-    print(f"[WARN] モデルが見つかりません。デフォルト: {pair}")
+    print(f"[WARN] モデルが見つかりません: {MODEL_PT}")
 
-MODEL_PT = f"./Models/dqn_policy_{pair}.pt"
-MODEL_PKL = f"./Models/dqn_scaler_{pair}.pkl"
+pair = "MultiCurrency"  # ログ用の識別名
 TICK_INTERVAL_SECONDS = 0.5
 CANDLE_TIMEFRAME = '1min'
-REQUIRED_CANDLES = 12
+REQUIRED_CANDLES = 75
 ENTRY_COOLDOWN_SECONDS = 15  # 1分BOの場合は15秒に短縮（トレンド継続を活用）
 LOG_DIR = "./logs"
 LOG_PATH = os.path.join(LOG_DIR, f"live_signals_{pair}.csv")
@@ -161,216 +73,6 @@ DQN_Q_MARGIN = 0.0  # Holdとの差でエントリーを抑制したければ正
 
 # トレンドフィルター設定（連敗システムは削除）
 # すべての連敗ストッパー機能を削除しました
-
-# -----------------------
-# FeatureExtraction（既存ロジック準拠）
-# -----------------------
-
-def _CalcRSIR(high_values, low_values, close_values, open_values, periods):
-    """RSI特徴量を計算（train_dqn.py互換）"""
-    result = []
-    for period in periods:
-        rsi_val = ta.RSI(close_values, period)
-        result.append(rsi_val)
-    return result
-
-def _CalcSMAR(close_values, periods):
-    """SMA特徴量を計算（train_dqn.py互換）"""
-    result = []
-    for period in periods:
-        ema_val = ta.EMA(close_values, period)
-        result.append(ema_val)
-    return result
-
-def _CalcOtherR(high_values, low_values, close_values, open_values):
-    """その他の特徴量を計算（train_dqn.py互換）"""
-    result = []
-    
-    # 基本的な価格比率
-    open_r = open_values / (close_values + 1e-8)
-    high_r = high_values / (close_values + 1e-8)
-    low_r = low_values / (close_values + 1e-8)
-    result.extend([open_r, high_r, low_r])
-    
-    # 価格レンジ
-    hl_ratio = (high_values - low_values) / (close_values + 1e-8)
-    oc_ratio = (open_values - close_values) / (close_values + 1e-8)
-    result.extend([hl_ratio, oc_ratio])
-    
-    # 簡単な技術指標
-    try:
-        # ストキャスティクス
-        slowk, slowd = ta.STOCH(high_values, low_values, close_values, 14)
-        result.extend([slowk, slowd])
-        
-        # MACD
-        macd, macdsignal, macdhist = ta.MACD(close_values)
-        result.extend([macd, macdsignal, macdhist])
-        
-        # Williams %R
-        willr = ta.WILLR(high_values, low_values, close_values)
-        result.append(willr)
-        
-        # CCI
-        cci = ta.CCI(high_values, low_values, close_values)
-        result.append(cci)
-        
-        # ROC
-        roc = ta.ROC(close_values)
-        result.append(roc)
-        
-        # ATR
-        atr = ta.ATR(high_values, low_values, close_values)
-        result.append(atr)
-        
-    except Exception as e:
-        # エラー時はゼロ埋め
-        num_missing = 9  # 上記の指標数
-        for _ in range(num_missing):
-            result.append(np.zeros_like(close_values))
-    
-    return result
-# 特徴量計算のキャッシュを追加
-_feature_cache = {}
-
-def FeatureExtraction(df):
-    """
-    df: pandas DataFrame with columns ['open', 'high', 'low', 'close', 'volume']
-    return: numpy array (shape: [n_timesteps, n_features=131])
-    train_dqn.pyと同じ特徴量数を生成
-    """
-    high_values = df['high'].values
-    low_values = df['low'].values
-    close_values = df['close'].values
-    open_values = df['open'].values
-    
-    # RSI (4種類): [7, 14, 21, 28]
-    periods_RSI = [7, 14, 21, 28]
-    rsi_features = _CalcRSIR(high_values, low_values, close_values, open_values, periods_RSI)
-    
-    # SMA (5種類): [5, 10, 20, 50, 100]
-    periods_SMA = [5, 10, 20, 50, 100]
-    sma_features = _CalcSMAR(close_values, periods_SMA)
-    
-    # その他の指標 (14種類)
-    other_features = _CalcOtherR(high_values, low_values, close_values, open_values)
-    
-    # 追加の特徴量（108種類）を生成してtrain_dqn.pyと同じ131次元にする
-    additional_features = []
-    
-    # 移動平均との関係
-    for period in [5, 10, 20, 50]:
-        try:
-            if len(close_values) >= period:
-                sma = pd.Series(close_values).rolling(period).mean().values
-                ema = pd.Series(close_values).ewm(span=period).mean().values
-                
-                # SMA距離
-                sma_distance = np.where(sma != 0, (close_values - sma) / sma, 0.0)
-                additional_features.append(sma_distance)
-                
-                # EMA距離
-                ema_distance = np.where(ema != 0, (close_values - ema) / ema, 0.0)
-                additional_features.append(ema_distance)
-                
-                # SMA-EMA差
-                sma_ema_diff = np.where(ema != 0, (sma - ema) / ema, 0.0)
-                additional_features.append(sma_ema_diff)
-        except:
-            # エラー時はゼロ埋め
-            for _ in range(3):
-                additional_features.append(np.zeros_like(close_values))
-    
-    # 価格変化率
-    for lookback in [2, 3, 5, 10]:
-        try:
-            price_change = pd.Series(close_values).pct_change(lookback).fillna(0).clip(-1, 1).values
-            additional_features.append(price_change)
-        except:
-            additional_features.append(np.zeros_like(close_values))
-    
-    # ボラティリティ指標
-    for period in [5, 10, 20]:
-        try:
-            volatility = pd.Series(close_values).rolling(period).std().fillna(0).values
-            additional_features.append(volatility)
-        except:
-            additional_features.append(np.zeros_like(close_values))
-    
-    # 高値・安値ブレイクアウト
-    for period in [10, 20]:
-        try:
-            high_series = pd.Series(high_values)
-            low_series = pd.Series(low_values)
-            
-            high_breakout = (high_values > high_series.rolling(period).max().shift(1).fillna(high_values[0])).astype(float)
-            low_breakout = (low_values < low_series.rolling(period).min().shift(1).fillna(low_values[0])).astype(float)
-            
-            additional_features.extend([high_breakout, low_breakout])
-        except:
-            additional_features.extend([np.zeros_like(close_values), np.zeros_like(close_values)])
-    
-    # さらに特徴量を追加して131次元に到達
-    remaining_features_needed = 131 - (len(rsi_features) + len(sma_features) + len(other_features) + len(additional_features))
-    
-    # 残りの特徴量を生成（簡単なノイズやトレンド指標）
-    for i in range(max(0, remaining_features_needed)):
-        try:
-            if i % 5 == 0:
-                # 価格のラグ特徴量
-                lag_feature = np.roll(close_values, i//5 + 1)
-                lag_feature[:i//5 + 1] = close_values[0]  # 最初の値で埋める
-                additional_features.append(lag_feature / (close_values + 1e-8))
-            elif i % 5 == 1:
-                # 移動平均の勾配
-                period = min(10 + i//5, len(close_values)-1)
-                if period > 1:
-                    ma = pd.Series(close_values).rolling(period).mean().values
-                    ma_slope = np.gradient(ma)
-                    additional_features.append(ma_slope)
-                else:
-                    additional_features.append(np.zeros_like(close_values))
-            elif i % 5 == 2:
-                # 高値と安値の比率
-                hl_spread = (high_values - low_values) / (high_values + low_values + 1e-8)
-                additional_features.append(hl_spread)
-            elif i % 5 == 3:
-                # 前日比の累積
-                daily_change = pd.Series(close_values).pct_change().fillna(0).values
-                cumulative_change = np.cumsum(daily_change) / (np.arange(len(daily_change)) + 1)
-                additional_features.append(cumulative_change)
-            else:
-                # ランダムウォーク特徴量
-                random_walk = np.cumsum(np.random.normal(0, 0.001, len(close_values)))
-                additional_features.append(random_walk)
-        except:
-            additional_features.append(np.zeros_like(close_values))
-    
-    # すべての特徴量を結合
-    all_features = rsi_features + sma_features + other_features + additional_features
-    
-    # 131次元に正確に調整
-    if len(all_features) > 131:
-        all_features = all_features[:131]
-    elif len(all_features) < 131:
-        # 不足分をゼロ埋め
-        missing = 131 - len(all_features)
-        for _ in range(missing):
-            all_features.append(np.zeros_like(close_values))
-    
-    # NaN処理
-    for i, feat in enumerate(all_features):
-        all_features[i] = np.nan_to_num(feat, nan=0.0, posinf=1e6, neginf=-1e6)
-    
-    # 配列に変換
-    result = np.column_stack(all_features)
-    
-    # データ型を確保
-    result = result.astype(np.float32)
-    
-    print(f"[DEBUG] FeatureExtraction output shape: {result.shape}")
-    
-    return result
 
 # ========================================
 # 連敗システム関連（一時的にコメントアウト）
@@ -665,15 +367,16 @@ def ensure_session(page, email, passward):
 def ticks_to_ohlc(ticks, timeframe_sec=60, max_bars=200):
     """ticks: list of (datetime, price)"""
     if not ticks:
-        return pd.DataFrame(columns=['ts','open','high','low','close'])
+        return pd.DataFrame(columns=['ts','open','high','low','close','volume'])
     df = pd.DataFrame(ticks, columns=['ts','price'])
     df['ts'] = pd.to_datetime(df['ts'])
     df = df.set_index('ts')
     ohlc = df['price'].resample(f'{timeframe_sec}s').ohlc()
+    volume = df['price'].resample(f'{timeframe_sec}s').count()
+    ohlc['volume'] = volume
     ohlc = ohlc.dropna().tail(max_bars).reset_index()
-    # rename to open/high/low/close
     ohlc = ohlc.rename(columns={'index':'ts'})
-    return ohlc[['ts','open','high','low','close']]
+    return ohlc[['ts','open','high','low','close','volume']]
 
 # -----------------------
 # DQN loader (flexible)
@@ -803,7 +506,7 @@ dqn_is_torch = False
 scaler = None  # スケーラーを追加
 
 def infer_feature_dim_for_model():
-    # build a dummy OHLC window so FeatureExtraction can compute features
+    # build a dummy OHLC window so shared preprocessing can compute features
     try:
         print("[DEBUG] Starting feature dimension inference...")
         N = max(50, REQUIRED_CANDLES + 20)  # より多くのサンプル
@@ -813,14 +516,17 @@ def infer_feature_dim_for_model():
             'open': base,
             'high': base + 0.0005,
             'low': base - 0.0005,
-            'close': base
+            'close': base,
+            'volume': np.ones_like(base)
         }, index=idx)
         print(f"[DEBUG] Created dummy data with shape: {dummy.shape}")
         
-        feat = FeatureExtraction(dummy)[-1:]
-        print(f"[DEBUG] Feature extraction result shape: {feat.shape}")
-        print(f"[INFO] 推定特徴量次元: {feat.shape[1]} + 2 (phase, range) = {feat.shape[1] + 2}")
-        return feat.shape[1]
+        phase = (dummy.index[-1].second % 60) / 60.0
+        sec_range = float(dummy['high'].iloc[-1] - dummy['low'].iloc[-1])
+        feat_vec = build_state_vec_fast(dummy, phase, sec_range)
+        print(f"[DEBUG] Feature extraction result length: {feat_vec.shape[0]}")
+        print(f"[INFO] 推定特徴量次元: {feat_vec.shape[0]}")
+        return feat_vec.shape[0]
     except Exception as e:
         print(f"[ERROR] 特徴量次元推定失敗: {e}")
         import traceback
@@ -1520,26 +1226,27 @@ with sync_playwright() as p:
             except Exception:
                 phase = 0.0
 
-            # FeatureExtraction expects DataFrame with open/high/low/close columns
+            # build_state_vec_fast expects train-style OHLCV columns
             try:
-                fea_ohlc = ohlc_data[['open','high','low','close']].copy()
-                feats_array = FeatureExtraction(fea_ohlc)
-                # take last row - should be 131 dimensions
-                feat_row = feats_array[-1].astype(np.float32)
-                print(f"[DEBUG] FeatureExtraction output shape: {feat_row.shape}")
-                
-                # 特徴量の正規化（スケーラーがある場合）
-                if scaler is not None:
-                    # スケーラーは131次元のみを期待しているので、131次元のみを正規化
-                    scaled_feat_row = scaler.transform([feat_row])[0].astype(np.float32)
-                    print(f"[DEBUG] Scaled feature vector shape: {scaled_feat_row.shape}")
-                else:
-                    scaled_feat_row = feat_row
-                
-                # Add phase and sec_range to make 133 dimensions total
+                fea_ohlc = ohlc_data[['open','high','low','close','volume']].copy()
                 sec_range = float(fea_ohlc['high'].iloc[-1] - fea_ohlc['low'].iloc[-1])
-                feat_vec = np.concatenate([scaled_feat_row, np.asarray([phase, sec_range], dtype=np.float32)])
-                print(f"[DEBUG] Final feature vector shape: {feat_vec.shape}")
+                state_vec = build_state_vec_fast(fea_ohlc, phase, sec_range)
+                print(f"[DEBUG] Raw state vector shape: {state_vec.shape}")
+
+                # Align with scaler expectation before normalization
+                scaled_vec = state_vec
+                if scaler is not None:
+                    scaler_dim = getattr(scaler, 'n_features_in_', state_vec.shape[0])
+                    if scaler_dim != state_vec.shape[0]:
+                        print(f"[WARN] State vector dim {state_vec.shape[0]} != scaler dim {scaler_dim}. Aligning...")
+                        if state_vec.shape[0] > scaler_dim:
+                            scaled_vec = state_vec[:scaler_dim]
+                        else:
+                            scaled_vec = np.pad(state_vec, (0, scaler_dim - state_vec.shape[0]), 'constant')
+                    scaled_vec = scaler.transform([scaled_vec])[0].astype(np.float32)
+                    print(f"[DEBUG] Scaled state vector shape: {scaled_vec.shape}")
+                else:
+                    scaled_vec = state_vec.astype(np.float32)
             except Exception as e:
                 print(f"[WARN] 特徴量抽出エラー: {e}")
                 time.sleep(TICK_INTERVAL_SECONDS)
@@ -1570,8 +1277,19 @@ with sync_playwright() as p:
             if dqn_is_torch and isinstance(dqn_model, nn.Module):
                 try:
                     with torch.no_grad():
-                        # モデルは131次元を期待しているので、最初の131次元のみを使用
-                        model_input = feat_vec[:131] if len(feat_vec) > 131 else feat_vec
+                        first_layer = None
+                        try:
+                            first_layer = dqn_model.feature_extractor[0]
+                        except Exception:
+                            first_layer = getattr(dqn_model.feature_extractor, '0', None)
+                        expected_dim = getattr(first_layer, 'in_features', scaled_vec.shape[0])
+                        model_input = scaled_vec
+                        if model_input.shape[0] != expected_dim:
+                            print(f"[WARN] Model expects {expected_dim} dims but received {model_input.shape[0]}. Aligning...")
+                            if model_input.shape[0] > expected_dim:
+                                model_input = model_input[:expected_dim]
+                            else:
+                                model_input = np.pad(model_input, (0, expected_dim - model_input.shape[0]), 'constant')
                         print(f"[DEBUG] Model input shape: {model_input.shape}")
                         t = torch.from_numpy(model_input).unsqueeze(0).float()
                         out = dqn_model(t)
@@ -1584,7 +1302,7 @@ with sync_playwright() as p:
                         q_values = np.pad(qv.astype(float), (0,3-qv.shape[0]), 'constant')
                     
                     # Epsilon-Greedy: 探索のため一定確率でランダム行動
-                    exploration_rate = 0.15  # 15%の確率でランダム選択
+                    exploration_rate = 0.30  # 30%の確率でランダム選択（High/Lowバランス改善）
                     if np.random.random() < exploration_rate:
                         action_idx = np.random.choice([0, 1, 2])
                         print(f"[EXPLORATION] ランダム選択 (epsilon={exploration_rate})")
