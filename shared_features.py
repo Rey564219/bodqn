@@ -363,9 +363,25 @@ def clear_feature_cache():
     _feature_cache.clear()
 
 
+def compute_trend_direction(data, short_window=5, long_window=20):
+    """Return short-vs-long average delta; >0 uptrend, <0 downtrend."""
+    if isinstance(data, pd.DataFrame):
+        series = data.get("close", pd.Series(dtype=float))
+    else:
+        series = pd.Series(data)
+    if series.empty:
+        return 0.0
+    short_window = max(1, min(short_window, len(series)))
+    long_window = max(1, min(long_window, len(series)))
+    short_avg = series.tail(short_window).mean()
+    long_avg = series.tail(long_window).mean()
+    return float(short_avg - long_avg)
+
+
 __all__ = [
     "FeatureExtraction",
     "build_state_vec",
     "build_state_vec_fast",
     "clear_feature_cache",
+    "compute_trend_direction",
 ]

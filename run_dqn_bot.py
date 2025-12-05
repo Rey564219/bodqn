@@ -26,7 +26,7 @@ import pandas as pd
 from datetime import datetime, timedelta
 from collections import deque
 
-from shared_features import build_state_vec_fast
+from shared_features import build_state_vec_fast, compute_trend_direction
 
 # Playwright
 from playwright.sync_api import sync_playwright
@@ -1227,10 +1227,12 @@ with sync_playwright() as p:
                 phase = 0.0
 
             # build_state_vec_fast expects train-style OHLCV columns
+            trend_dir = 0.0
             try:
                 fea_ohlc = ohlc_data[['open','high','low','close','volume']].copy()
                 sec_range = float(fea_ohlc['high'].iloc[-1] - fea_ohlc['low'].iloc[-1])
                 state_vec = build_state_vec_fast(fea_ohlc, phase, sec_range)
+                trend_dir = compute_trend_direction(fea_ohlc)
                 print(f"[DEBUG] Raw state vector shape: {state_vec.shape}")
 
                 # Align with scaler expectation before normalization
@@ -1301,14 +1303,28 @@ with sync_playwright() as p:
                     else:
                         q_values = np.pad(qv.astype(float), (0,3-qv.shape[0]), 'constant')
                     
+                    # トレンドに逆らう行動は禁止
+                    trend_threshold = 1e-6
+                    disallowed_action = None
+                    if trend_dir > trend_threshold:
+                        disallowed_action = 2  # Low禁止
+                    elif trend_dir < -trend_threshold:
+                        disallowed_action = 1  # High禁止
+                    allowed_actions = [0, 1, 2]
+                    adjusted_q = q_values.copy()
+                    if disallowed_action is not None:
+                        allowed_actions.remove(disallowed_action)
+                        adjusted_q[disallowed_action] = -1e9
+                        direction = "up" if disallowed_action == 2 else "down"
+                        print(f"[TREND] {direction}trend detected -> suppressing {'Low' if disallowed_action == 2 else 'High'} entries")
                     # Epsilon-Greedy: 探索のため一定確率でランダム行動
                     exploration_rate = 0.30  # 30%の確率でランダム選択（High/Lowバランス改善）
                     if np.random.random() < exploration_rate:
-                        action_idx = np.random.choice([0, 1, 2])
+                        action_idx = int(np.random.choice(allowed_actions))
                         print(f"[EXPLORATION] ランダム選択 (epsilon={exploration_rate})")
                     else:
                         # Q値から行動を選択（単純にargmax）
-                        action_idx = int(np.argmax(q_values))
+                        action_idx = int(np.argmax(adjusted_q))
                     
                     # デバッグ用: 各Q値の詳細表示
                     hold_q = q_values[0]

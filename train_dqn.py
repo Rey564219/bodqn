@@ -50,6 +50,7 @@ from shared_features import (
     build_state_vec,
     build_state_vec_fast,
     clear_feature_cache,
+    compute_trend_direction,
 )
 
 pair = "USDJPY"
@@ -279,7 +280,7 @@ def build_state_batch_parallel(ohlc_data_list, extra_list=None, n_workers=None):
     
     return np.stack(states, axis=0).astype(np.float32)
 
-def compute_reward(entry_action, next_close, entry_price, market_context=None):
+def compute_reward(entry_action, next_close, entry_price, trend_dir=0.0, market_context=None):
     if entry_action == 0:  # Hold
         return 0.0
     
@@ -297,6 +298,13 @@ def compute_reward(entry_action, next_close, entry_price, market_context=None):
     else:
         return 0.0
     
+    # 逆張りを即座に罰する（上昇トレンドでLow、下降トレンドでHigh）
+    trend_threshold = 1e-6
+    if entry_action == 1 and trend_dir < -trend_threshold:
+        return -30.0
+    if entry_action == 2 and trend_dir > trend_threshold:
+        return -30.0
+
     # 絶対的勝率優先報酬設計（80%+確実達成）
     if direction_correct:
         # 成功時：極めて巨大な報酬（勝利を徹底的に強化）
@@ -664,7 +672,9 @@ def train_dqn(ohlc_df, pair=pair, save_dir="./Models",
                 # 価格情報の高速取得
                 entry_price = float(ohlc_df['close'].iloc[i])
                 next_close = float(ohlc_df['close'].iloc[i+1])
-                r = compute_reward(a, next_close, entry_price)
+                trend_slice = ohlc_df['close'].iloc[max(0, i-20):i+1]
+                trend_dir = compute_trend_direction(trend_slice)
+                r = compute_reward(a, next_close, entry_price, trend_dir=trend_dir)
                 reward_history.append(r)
                 
                 # 統計記録
@@ -897,7 +907,8 @@ def evaluate_dqn_model(q, scaler, ohlc_df, n_eval=2000, device='cpu', window_siz
             sl = ohlc_df.iloc[i-20:i+1].copy()
             entry_price = float(sl['close'].iloc[-1])
             next_close = float(ohlc_df['close'].iloc[i+1])
-            r = compute_reward(a, next_close, entry_price)
+            trend_dir = compute_trend_direction(sl['close'])
+            r = compute_reward(a, next_close, entry_price, trend_dir=trend_dir)
 
             # アクション別統計
             if a == 0:  # Hold
