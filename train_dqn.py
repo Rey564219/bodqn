@@ -672,8 +672,8 @@ def train_dqn(ohlc_df, pair=pair, save_dir="./Models",
                 # 価格情報の高速取得
                 entry_price = float(ohlc_df['close'].iloc[i])
                 next_close = float(ohlc_df['close'].iloc[i+1])
-                trend_slice = ohlc_df['close'].iloc[max(0, i-20):i+1]
-                trend_dir = compute_trend_direction(trend_slice)
+                trend_slice = ohlc_df['close'].iloc[max(0, i-window_size):i+1]
+                trend_dir = compute_trend_direction(trend_slice, window=window_size)
                 r = compute_reward(a, next_close, entry_price, trend_dir=trend_dir)
                 reward_history.append(r)
                 
@@ -904,10 +904,10 @@ def evaluate_dqn_model(q, scaler, ohlc_df, n_eval=2000, device='cpu', window_siz
         
         # 報酬計算と勝率判定
         for idx, (i, a) in enumerate(zip(batch_idxs, actions)):
-            sl = ohlc_df.iloc[i-20:i+1].copy()
+            sl = ohlc_df.iloc[max(0, i-window_size):i+1].copy()
             entry_price = float(sl['close'].iloc[-1])
             next_close = float(ohlc_df['close'].iloc[i+1])
-            trend_dir = compute_trend_direction(sl['close'])
+            trend_dir = compute_trend_direction(sl['close'], window=window_size)
             r = compute_reward(a, next_close, entry_price, trend_dir=trend_dir)
 
             # アクション別統計

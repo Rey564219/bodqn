@@ -363,19 +363,21 @@ def clear_feature_cache():
     _feature_cache.clear()
 
 
-def compute_trend_direction(data, short_window=5, long_window=20):
-    """Return short-vs-long average delta; >0 uptrend, <0 downtrend."""
+def compute_trend_direction(data, window=75):
+    """Return close difference between the latest bar and the bar `window` steps back."""
     if isinstance(data, pd.DataFrame):
         series = data.get("close", pd.Series(dtype=float))
     else:
         series = pd.Series(data)
     if series.empty:
         return 0.0
-    short_window = max(1, min(short_window, len(series)))
-    long_window = max(1, min(long_window, len(series)))
-    short_avg = series.tail(short_window).mean()
-    long_avg = series.tail(long_window).mean()
-    return float(short_avg - long_avg)
+    window = max(1, window)
+    start_idx = max(0, len(series) - window)
+    start_price = float(series.iloc[start_idx])
+    end_price = float(series.iloc[-1])
+    if not np.isfinite(start_price) or not np.isfinite(end_price):
+        return 0.0
+    return end_price - start_price
 
 
 __all__ = [
