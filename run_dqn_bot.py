@@ -39,16 +39,20 @@ import torch.nn.functional as F
 # -----------------------
 # 設定
 # -----------------------
-# 複数通貨ペアで学習した統合モデルを使用
-# モデルファイル名は固定: dqn_policy.pt / dqn_scaler.pkl
-MODEL_PT = "./Models/dqn_policy.pt"
+# High/Low専用モデルを使用（train_dqn.pyで学習した2つのモデル）
+MODEL_FILES = {
+    "high": "./Models/dqn_policy_high.pt",
+    "low": "./Models/dqn_policy_low.pt",
+}
+MODE_LABELS = {"high": "High", "low": "Low"}
 MODEL_PKL = "./Models/dqn_scaler.pkl"
 
 # モデルファイルの存在確認
-if os.path.exists(MODEL_PT):
-    print(f"[INFO] 統合モデルを使用: {MODEL_PT}")
-else:
-    print(f"[WARN] モデルが見つかりません: {MODEL_PT}")
+for mode, path in MODEL_FILES.items():
+    if os.path.exists(path):
+        print(f"[INFO] {MODE_LABELS[mode]}モデルを使用: {path}")
+    else:
+        print(f"[WARN] {MODE_LABELS[mode]}モデルが見つかりません: {path}")
 
 pair = "MultiCurrency"  # ログ用の識別名
 TICK_INTERVAL_SECONDS = 0.5
@@ -59,13 +63,15 @@ LOG_DIR = "./logs"
 LOG_PATH = os.path.join(LOG_DIR, f"live_signals_{pair}.csv")
 os.makedirs(LOG_DIR, exist_ok=True)
 
-# ログヘッダ
+# ログヘッダ（デュアルモデル用に拡張）
 if not os.path.exists(LOG_PATH):
     with open(LOG_PATH, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         w.writerow([
             "ts","price","phase",
-            "q_hold","q_high","q_low","action_idx","action","entry","reason"
+            "high_hold_q","high_entry_q","high_signal",
+            "low_hold_q","low_entry_q","low_signal",
+            "final_action","entry","reason"
         ])
 
 # DQNの閾値（Holdをスキップする／しきい値）
@@ -501,7 +507,8 @@ class QNet(nn.Module):
         # 確信度で重み付け
         return q_values * confidence
 
-dqn_model = None
+# デュアルモデル用の変数
+dqn_models = {"high": None, "low": None}
 dqn_is_torch = False
 scaler = None  # スケーラーを追加
 
@@ -533,78 +540,80 @@ def infer_feature_dim_for_model():
         print(f"[DEBUG] Feature inference traceback:\n{traceback.format_exc()}")
         return 50  # より大きなfallback値
 
-# try torch .pt first
-if os.path.exists(MODEL_PT):
-    try:
-        print(f"[DEBUG] Loading model from: {MODEL_PT}")
-        ck = torch.load(MODEL_PT, map_location="cpu")
-        print(f"[DEBUG] Loaded object type: {type(ck)}")
-        
-        # train_dqn.pyは直接state_dictを保存している
-        # 保存されたモデルの入力次元を確認
-        print("[DEBUG] Checking saved model dimensions...")
-        if isinstance(ck, dict) and 'feature_extractor.0.weight' in ck:
-            saved_input_dim = ck['feature_extractor.0.weight'].shape[1]
-            print(f"[DEBUG] Saved model input dimension: {saved_input_dim}")
-        else:
-            # フォールバック：特徴量次元を動的に推論
-            print("[DEBUG] Could not determine saved model dimensions, inferring...")
-            saved_input_dim = 131  # 保存されたモデルの実際の次元
+# Load both High and Low models
+for mode, model_path in MODEL_FILES.items():
+    if os.path.exists(model_path):
+        try:
+            print(f"[DEBUG] Loading {MODE_LABELS[mode]} model from: {model_path}")
+            ck = torch.load(model_path, map_location="cpu")
+            print(f"[DEBUG] Loaded object type: {type(ck)}")
             
-        print(f"[DEBUG] Creating QNet with in_dim={saved_input_dim}, out_dim=3")
-        qnet = QNet(saved_input_dim, 3)
-        
-        if isinstance(ck, dict) and ("model_state_dict" in ck or "state_dict" in ck):
-            # 辞書形式の場合
-            print("[DEBUG] Dict with model_state_dict/state_dict detected")
-            st = ck.get("model_state_dict", ck.get("state_dict"))
-            qnet.load_state_dict(st)
-            print("[INFO] DQN (torch wrapped state_dict) ロード完了")
-        elif isinstance(ck, dict):
-            # 直接state_dictの場合（train_dqn.pyの保存形式）
-            print("[DEBUG] Direct state_dict detected")
-            print(f"[DEBUG] State dict keys count: {len(ck.keys())}")
-            print(f"[DEBUG] First few keys: {list(ck.keys())[:3]}...")
+            # train_dqn.pyは直接state_dictを保存している
+            # 保存されたモデルの入力次元を確認
+            print(f"[DEBUG] Checking saved {MODE_LABELS[mode]} model dimensions...")
+            if isinstance(ck, dict) and 'feature_extractor.0.weight' in ck:
+                saved_input_dim = ck['feature_extractor.0.weight'].shape[1]
+                print(f"[DEBUG] Saved {MODE_LABELS[mode]} model input dimension: {saved_input_dim}")
+            else:
+                # フォールバック：特徴量次元を動的に推論
+                print("[DEBUG] Could not determine saved model dimensions, inferring...")
+                saved_input_dim = 131  # 保存されたモデルの実際の次元
+                
+            # train_dqn.pyでは各モデルは2出力（Hold, Entry）
+            print(f"[DEBUG] Creating QNet for {MODE_LABELS[mode]} with in_dim={saved_input_dim}, out_dim=2")
+            qnet = QNet(saved_input_dim, 2)  # 2出力: Hold, Entry
             
-            try:
-                qnet.load_state_dict(ck)
-                print("[INFO] DQN (torch direct state_dict) ロード完了")
-            except Exception as load_error:
-                print(f"[ERROR] State dict loading failed: {load_error}")
-                print("[DEBUG] Model structure mismatch - checking sizes...")
-                for name, param in qnet.named_parameters():
-                    if name in ck:
-                        expected_shape = param.shape
-                        actual_shape = ck[name].shape
-                        if expected_shape != actual_shape:
-                            print(f"[ERROR] Size mismatch for {name}: expected {expected_shape}, got {actual_shape}")
-                    else:
-                        print(f"[ERROR] Missing key in state_dict: {name}")
+            if isinstance(ck, dict) and ("model_state_dict" in ck or "state_dict" in ck):
+                # 辞書形式の場合
+                print("[DEBUG] Dict with model_state_dict/state_dict detected")
+                st = ck.get("model_state_dict", ck.get("state_dict"))
+                qnet.load_state_dict(st)
+                print(f"[INFO] {MODE_LABELS[mode]} DQN (torch wrapped state_dict) ロード完了")
+            elif isinstance(ck, dict):
+                # 直接state_dictの場合（train_dqn.pyの保存形式）
+                print("[DEBUG] Direct state_dict detected")
+                print(f"[DEBUG] State dict keys count: {len(ck.keys())}")
+                print(f"[DEBUG] First few keys: {list(ck.keys())[:3]}...")
+                
+                try:
+                    qnet.load_state_dict(ck)
+                    print(f"[INFO] {MODE_LABELS[mode]} DQN (torch direct state_dict) ロード完了")
+                except Exception as load_error:
+                    print(f"[ERROR] {MODE_LABELS[mode]} state dict loading failed: {load_error}")
+                    print("[DEBUG] Model structure mismatch - checking sizes...")
+                    for name, param in qnet.named_parameters():
+                        if name in ck:
+                            expected_shape = param.shape
+                            actual_shape = ck[name].shape
+                            if expected_shape != actual_shape:
+                                print(f"[ERROR] Size mismatch for {name}: expected {expected_shape}, got {actual_shape}")
+                        else:
+                            print(f"[ERROR] Missing key in state_dict: {name}")
+                    qnet = None
+            elif isinstance(ck, nn.Module):
+                # モジュール全体が保存されている場合
+                print("[DEBUG] PyTorch module detected")
+                qnet = ck
+                print(f"[INFO] {MODE_LABELS[mode]} DQN (torch module) ロード完了")
+            else:
+                print(f"[ERROR] {MODE_LABELS[mode]} MODEL 読込はしたが形式不明: {type(ck)}")
+                if hasattr(ck, '__dict__'):
+                    print(f"[DEBUG] Object attributes: {list(vars(ck).keys())}")
                 qnet = None
-        elif isinstance(ck, nn.Module):
-            # モジュール全体が保存されている場合
-            print("[DEBUG] PyTorch module detected")
-            qnet = ck
-            print("[INFO] DQN (torch module) ロード完了")
-        else:
-            print(f"[ERROR] MODEL_PT 読込はしたが形式不明: {type(ck)}")
-            if hasattr(ck, '__dict__'):
-                print(f"[DEBUG] Object attributes: {list(vars(ck).keys())}")
-            qnet = None
-        
-        if qnet is not None:
-            qnet.eval()
-            dqn_model = qnet
-            dqn_is_torch = True
-            print(f"[INFO] Model successfully loaded and set to eval mode")
-        
-    except Exception as e:
-        print(f"[ERROR] torch load 失敗: {e}")
-        import traceback
-        print(f"[DEBUG] Full traceback:\n{traceback.format_exc()}")
-        dqn_model = None
-else:
-    print(f"[ERROR] Model file not found: {MODEL_PT}")
+            
+            if qnet is not None:
+                qnet.eval()
+                dqn_models[mode] = qnet
+                dqn_is_torch = True
+                print(f"[INFO] {MODE_LABELS[mode]} model successfully loaded and set to eval mode")
+            
+        except Exception as e:
+            print(f"[ERROR] {MODE_LABELS[mode]} torch load 失敗: {e}")
+            import traceback
+            print(f"[DEBUG] Full traceback:\n{traceback.format_exc()}")
+            dqn_models[mode] = None
+    else:
+        print(f"[ERROR] {MODE_LABELS[mode]} model file not found: {model_path}")
 
 # Load scaler
 try:
@@ -615,10 +624,12 @@ except Exception as e:
     print(f"[WARN] Scaler load 失敗: {e}")
     scaler = None
 
-if dqn_model is None:
+if dqn_models["high"] is None or dqn_models["low"] is None:
     print("[ERROR] DQNモデルが見つかりません。予測はスキップされます。")
-    print(f"[DEBUG] MODEL_PT: {MODEL_PT}")
-    print(f"[DEBUG] ファイル存在: {os.path.exists(MODEL_PT)}")
+    print(f"[DEBUG] High model: {dqn_models['high'] is not None}")
+    print(f"[DEBUG] Low model: {dqn_models['low'] is not None}")
+    for mode, path in MODEL_FILES.items():
+        print(f"[DEBUG] {MODE_LABELS[mode]} file exists: {os.path.exists(path)}")
 else:
     print(f"[INFO] DQNモデル読み込み成功 - PyTorch: {dqn_is_torch}")
 
@@ -1007,31 +1018,29 @@ def scrape_trade_results(page):
 # 連敗システム終わり
 # ========================================
 
-def _log_signal(ts, price, phase, q_values, action_idx, action_str, entry, reason, slope_info=None):
+def _log_signal(ts, price, phase, high_q, low_q, high_signal, low_signal, final_action, entry, reason):
+    """デュアルモデル用のログ関数
+    
+    Args:
+        high_q: HighモデルのQ値 [Hold, Entry]
+        low_q: LowモデルのQ値 [Hold, Entry]
+        high_signal: Highモデルのシグナル ("Hold" or "Entry")
+        low_signal: Lowモデルのシグナル ("Hold" or "Entry")
+        final_action: 最終判定 ("Hold", "High", "Low")
+    """
     try:
-        q_hold = q_values[0] if q_values is not None else ""
-        q_high = q_values[1] if q_values is not None else ""
-        q_low  = q_values[2] if q_values is not None else ""
-        
-        # 傾き・負け履歴情報を理由に追加
-        if slope_info:
-            slope_suffix = f"|slope:{slope_info['price_slope']:.6f}"
-            slope_suffix += f"|decline:{slope_info['is_declining']}"
-            slope_suffix += f"|high_losses:{slope_info['recent_high_losses']}"
-            slope_suffix += f"|low_losses:{slope_info['recent_low_losses']}"
-            if slope_info['should_block_high']:
-                slope_suffix += "|BLOCK_HIGH"
-            elif slope_info['should_block_low']:
-                slope_suffix += "|BLOCK_LOW"
-            reason = (reason or "") + slope_suffix
+        high_hold = high_q[0] if high_q is not None else ""
+        high_entry = high_q[1] if high_q is not None else ""
+        low_hold = low_q[0] if low_q is not None else ""
+        low_entry = low_q[1] if low_q is not None else ""
         
         with open(LOG_PATH, "a", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
             w.writerow([
                 ts.isoformat(), price, round(phase,4),
-                q_hold, q_high, q_low,
-                action_idx if action_idx is not None else "",
-                action_str or "",
+                high_hold, high_entry, high_signal or "",
+                low_hold, low_entry, low_signal or "",
+                final_action or "",
                 int(bool(entry)),
                 reason or ""
             ])
@@ -1254,103 +1263,118 @@ with sync_playwright() as p:
                 time.sleep(TICK_INTERVAL_SECONDS)
                 continue
 
-            # Predict via model (if present)
-            q_values = None
-            action_idx = None
-            action_str = None
+            # Predict via dual models
+            high_q = None
+            low_q = None
+            high_signal = None
+            low_signal = None
+            final_action = None
             entry = False
             reason = ""
 
-            if dqn_model is None:
+            # モデルの存在確認
+            if dqn_models["high"] is None or dqn_models["low"] is None:
                 reason = "no_model"
                 print(f"[{current_time.strftime('%H:%M:%S')}] モデル無し - スキップ")
-                _log_signal(current_time, current_price, phase, None, None, "Hold", False, reason)
+                _log_signal(current_time, current_price, phase, None, None, None, None, "Hold", False, reason)
                 time.sleep(TICK_INTERVAL_SECONDS)
                 continue
                 
             if scaler is None:
                 reason = "no_scaler"
                 print(f"[{current_time.strftime('%H:%M:%S')}] スケーラー無し - スキップ")
-                _log_signal(current_time, current_price, phase, None, None, "Hold", False, reason)
+                _log_signal(current_time, current_price, phase, None, None, None, None, "Hold", False, reason)
                 time.sleep(TICK_INTERVAL_SECONDS)
                 continue
 
-            # Torch model prediction
-            if dqn_is_torch and isinstance(dqn_model, nn.Module):
+            # Dual model prediction
+            if dqn_is_torch:
                 try:
+                    # 共通の入力準備
                     with torch.no_grad():
+                        model_input = scaled_vec
+                        
+                        # Highモデルの推論
+                        high_model = dqn_models["high"]
                         first_layer = None
                         try:
-                            first_layer = dqn_model.feature_extractor[0]
+                            first_layer = high_model.feature_extractor[0]
                         except Exception:
-                            first_layer = getattr(dqn_model.feature_extractor, '0', None)
+                            first_layer = getattr(high_model.feature_extractor, '0', None)
                         expected_dim = getattr(first_layer, 'in_features', scaled_vec.shape[0])
-                        model_input = scaled_vec
+                        
                         if model_input.shape[0] != expected_dim:
                             print(f"[WARN] Model expects {expected_dim} dims but received {model_input.shape[0]}. Aligning...")
                             if model_input.shape[0] > expected_dim:
                                 model_input = model_input[:expected_dim]
                             else:
                                 model_input = np.pad(model_input, (0, expected_dim - model_input.shape[0]), 'constant')
-                        print(f"[DEBUG] Model input shape: {model_input.shape}")
+                        
                         t = torch.from_numpy(model_input).unsqueeze(0).float()
-                        out = dqn_model(t)
-                        qv = out.cpu().numpy().reshape(-1)
-                    
-                    # Ensure qv length 3
-                    if qv.shape[0] >= 3:
-                        q_values = qv[:3].astype(float)
-                    else:
-                        q_values = np.pad(qv.astype(float), (0,3-qv.shape[0]), 'constant')
-                    
-                    # トレンドに逆らう行動は禁止
-                    trend_threshold = 1e-6
-                    disallowed_action = None
-                    if trend_dir > trend_threshold:
-                        disallowed_action = 2  # Low禁止
-                    elif trend_dir < -trend_threshold:
-                        disallowed_action = 1  # High禁止
-                    allowed_actions = [0, 1, 2]
-                    adjusted_q = q_values.copy()
-                    if disallowed_action is not None:
-                        allowed_actions.remove(disallowed_action)
-                        adjusted_q[disallowed_action] = -1e9
-                        direction = "up" if disallowed_action == 2 else "down"
-                        print(f"[TREND] {direction}trend detected -> suppressing {'Low' if disallowed_action == 2 else 'High'} entries")
-                    # Epsilon-Greedy: 探索のため一定確率でランダム行動
-                    exploration_rate = 0.30  # 30%の確率でランダム選択（High/Lowバランス改善）
-                    if np.random.random() < exploration_rate:
-                        action_idx = int(np.random.choice(allowed_actions))
-                        print(f"[EXPLORATION] ランダム選択 (epsilon={exploration_rate})")
-                    else:
-                        # Q値から行動を選択（単純にargmax）
-                        action_idx = int(np.argmax(adjusted_q))
-                    
-                    # デバッグ用: 各Q値の詳細表示
-                    hold_q = q_values[0]
-                    high_q = q_values[1]
-                    low_q = q_values[2]
-                    
-                    # map idx -> action: 0=Hold,1=High,2=Low
-                    action_map = {0:"Hold", 1:"High", 2:"Low"}
-                    action_str = action_map.get(action_idx, "Hold")
-                    
-                    # Q値の詳細をログ出力（デバッグ用）
-                    print(f"[Q-VALUES] Hold:{q_values[0]:.4f}, High:{q_values[1]:.4f}, Low:{q_values[2]:.4f}")
-                    print(f"[ACTION] 選択されたアクション: {action_str} (idx:{action_idx})")
-
-
+                        
+                        # Highモデル: [Hold, Entry]
+                        high_out = high_model(t)
+                        high_q = high_out.cpu().numpy().reshape(-1).astype(float)
+                        high_signal = "Entry" if high_q[1] > high_q[0] else "Hold"
+                        
+                        # Lowモデル: [Hold, Entry]
+                        low_model = dqn_models["low"]
+                        low_out = low_model(t)
+                        low_q = low_out.cpu().numpy().reshape(-1).astype(float)
+                        low_signal = "Entry" if low_q[1] > low_q[0] else "Hold"
+                        
+                        # Q値の詳細をログ出力
+                        print(f"[HIGH Q-VALUES] Hold:{high_q[0]:.4f}, Entry:{high_q[1]:.4f} -> {high_signal}")
+                        print(f"[LOW Q-VALUES]  Hold:{low_q[0]:.4f}, Entry:{low_q[1]:.4f} -> {low_signal}")
+                        
+                        # デュアルモデルの判定ロジック
+                        # 両方がEntryシグナルを出した場合はHold（保留）
+                        if high_signal == "Entry" and low_signal == "Entry":
+                            final_action = "Hold"
+                            reason = "both_signals_conflict"
+                            print(f"[DECISION] ❗ 両方のモデルがエントリーシグナル -> 保留 (Hold)")
+                        elif high_signal == "Entry":
+                            # Highのみエントリーシグナル
+                            # トレンドフィルターを適用
+                            trend_threshold = 1e-6
+                            if trend_dir < -trend_threshold:
+                                final_action = "Hold"
+                                reason = "high_blocked_by_downtrend"
+                                print(f"[TREND] 下降トレンド検出 -> Highエントリーを抽制")
+                            else:
+                                final_action = "High"
+                                reason = "high_entry_signal"
+                                print(f"[DECISION] ✅ Highエントリーシグナル")
+                        elif low_signal == "Entry":
+                            # Lowのみエントリーシグナル
+                            # トレンドフィルターを適用
+                            trend_threshold = 1e-6
+                            if trend_dir > trend_threshold:
+                                final_action = "Hold"
+                                reason = "low_blocked_by_uptrend"
+                                print(f"[TREND] 上昇トレンド検出 -> Lowエントリーを抽制")
+                            else:
+                                final_action = "Low"
+                                reason = "low_entry_signal"
+                                print(f"[DECISION] ✅ Lowエントリーシグナル")
+                        else:
+                            # 両方ともHold
+                            final_action = "Hold"
+                            reason = "both_hold"
+                            print(f"[DECISION] 🔴 両方のモデルがHoldシグナル")
                     
                 except Exception as e:
                     print(f"[WARN] モデル推論失敗: {e}")
+                    import traceback
+                    print(traceback.format_exc())
                     reason = "predict_error"
-                    _log_signal(current_time, current_price, phase, None, None, "Hold", False, reason)
+                    _log_signal(current_time, current_price, phase, None, None, None, None, "Hold", False, reason)
                     time.sleep(TICK_INTERVAL_SECONDS)
                     continue
             else:
                 reason = "unsupported_model"
                 print(f"[WARN] 非Torchモデルはサポートされていません")
-                _log_signal(current_time, current_price, phase, None, None, "Hold", False, reason)
+                _log_signal(current_time, current_price, phase, None, None, None, None, "Hold", False, reason)
                 time.sleep(TICK_INTERVAL_SECONDS)
                 continue
 
@@ -1414,54 +1438,34 @@ with sync_playwright() as p:
             # 連敗システム終わり
             # ========================================
 
-            # Decide entry: skip Hold
-            if action_str == "Hold":
-                # reason = filter_reason or "hold"  # 連敗システムコメントアウト
-                reason = "hold"
+            # Decide entry based on final_action
+            if final_action == "Hold":
                 entry = False
-                print(f"[{current_time.strftime('%H:%M:%S')}] Hold - Q値: Hold={q_values[0]:.3f}, High={q_values[1]:.3f}, Low={q_values[2]:.3f}")
-                # if filter_reason:  # 連敗システムコメントアウト
-                #     print(f"[{current_time.strftime('%H:%M:%S')}] トレンドフィルターによりHold: {filter_reason}")
+                print(f"[{current_time.strftime('%H:%M:%S')}] Hold")
             else:
-                # optionally require q advantage over hold
-                q_advantage = q_values[action_idx] - q_values[0]
-                if q_advantage >= DQN_Q_MARGIN:
-                    # cooldown check
-                    if next_entry_allowed_time and current_time < next_entry_allowed_time:
-                        reason = "cooldown"
-                        entry = False
-                        print(f"[{current_time.strftime('%H:%M:%S')}] {action_str} - クールダウン中 (残り{(next_entry_allowed_time-current_time).total_seconds():.1f}秒)")
-                    else:
-                        # execute entry
-                        sel = '.invest-btn-up.button' if action_str == "High" else '.invest-btn-down.button'
-                        btn = page.query_selector(sel)
-                        if btn:
-                            human_click(btn, page)
-                            last_entry_time = current_time
-                            next_entry_allowed_time = current_time + timedelta(seconds=ENTRY_COOLDOWN_SECONDS)
-                            entry = True
-                            # reason = filter_reason or "entry_executed"  # 連敗システムコメントアウト
-                            reason = "entry_executed"
-                            print(f"[ENTRY] {action_str} at {current_time.strftime('%H:%M:%S')} price={current_price} Q値: {q_values[action_idx]:.3f} (優位性: {q_advantage:.3f})")
-                            # if original_action != action_str:  # 連敗システムコメントアウト
-                            #     print(f"[ENTRY] 元の予測:{original_action} -> トレンドフィルター適用後:{action_str}")
-                            
-                            # 取引を待ちリストに追加（60秒後に結果確認）※連敗システムコメントアウト
-                            # pending_trades.append((current_time, action_str, current_price))
-                            # print(f"[INFO] 取引を待ちリストに追加（60秒後に結果確認）")
-                        else:
-                            reason = "button_not_found"
-                            entry = False
-                            print(f"[WARN] {action_str}ボタンが見つかりません")
-                else:
-                    reason = "insufficient_q_advantage"
+                # cooldown check
+                if next_entry_allowed_time and current_time < next_entry_allowed_time:
+                    reason = "cooldown"
                     entry = False
-                    print(f"[{current_time.strftime('%H:%M:%S')}] {action_str} - Q値優位性不足 ({q_advantage:.3f} < {DQN_Q_MARGIN})")
+                    print(f"[{current_time.strftime('%H:%M:%S')}] {final_action} - クールダウン中 (残り{(next_entry_allowed_time-current_time).total_seconds():.1f}秒)")
+                else:
+                    # execute entry
+                    sel = '.invest-btn-up.button' if final_action == "High" else '.invest-btn-down.button'
+                    btn = page.query_selector(sel)
+                    if btn:
+                        human_click(btn, page)
+                        last_entry_time = current_time
+                        next_entry_allowed_time = current_time + timedelta(seconds=ENTRY_COOLDOWN_SECONDS)
+                        entry = True
+                        reason = "entry_executed"
+                        print(f"[ENTRY] ✅ {final_action} at {current_time.strftime('%H:%M:%S')} price={current_price}")
+                    else:
+                        reason = "button_not_found"
+                        entry = False
+                        print(f"[WARN] {final_action}ボタンが見つかりません")
 
             # log
-            # slope_info = slope_analysis if 'slope_analysis' in locals() else None  # 連敗システムコメントアウト
-            slope_info = None
-            _log_signal(current_time, current_price, phase, q_values, action_idx, action_str, entry, reason, slope_info)
+            _log_signal(current_time, current_price, phase, high_q, low_q, high_signal, low_signal, final_action, entry, reason)
 
             # ========================================
             # 待機中の取引結果確認（連敗システム）※コメントアウト
@@ -1519,4 +1523,3 @@ with sync_playwright() as p:
             # 一時的にticksをクリアしてリカバリ
             all_ticks = []
             time.sleep(TICK_INTERVAL_SECONDS)
-

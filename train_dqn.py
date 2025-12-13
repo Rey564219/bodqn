@@ -54,7 +54,11 @@ from shared_features import (
 )
 
 pair = "USDJPY"
-ACTIONS = 3  # 0:Hold, 1:High, 2:Low
+ACTIONS = 2  # 0:Hold, 1:Mode-specific action (High or Low)
+ACTION_MODES = {
+    "high": {"label": "High", "id": 1, "model_name": "dqn_policy_high.pt"},
+    "low": {"label": "Low", "id": 2, "model_name": "dqn_policy_low.pt"},
+}
 
 class QNet(nn.Module):
     def __init__(self, in_dim, out_dim):
@@ -368,7 +372,8 @@ def train_dqn(ohlc_df, pair=pair, save_dir="./Models",
               warmup=12000, updates=200000, target_sync=2000,  # 超長期学習
               epsilon_start=0.99, epsilon_end=0.001, epsilon_decay=100000,  # 超慎重探索
               device='cuda' if torch.cuda.is_available() else 'cpu',
-              num_workers=2, max_time_hours=8):  # 80%勝率確実達成のための学習時間
+              num_workers=2, max_time_hours=8,
+              target_action='high'):  # 80%勝率確実達成のための学習時間
     
     # 保存ディレクトリを確実に作成（絶対パスで）
     import os
@@ -387,7 +392,16 @@ def train_dqn(ohlc_df, pair=pair, save_dir="./Models",
         print(f"[ERROR] Cannot write to {save_dir}: {e}")
         raise
 
+    target_key = str(target_action).lower()
+    if target_key not in ACTION_MODES:
+        raise ValueError(f"Unsupported target_action '{target_action}'. Choose from {list(ACTION_MODES.keys())}.")
+    mode_cfg = ACTION_MODES[target_key]
+    action_label = mode_cfg['label']
+    action_id = mode_cfg['id']
+    model_filename = mode_cfg['model_name']
+
     print(f"[INFO] Using device: {device}")
+    print(f"[INFO] Training dedicated {action_label} model (action id {action_id})")
     
     # タイムアウト設定
     import time
@@ -425,9 +439,9 @@ def train_dqn(ohlc_df, pair=pair, save_dir="./Models",
     #    - High/Lowで完全に対称的な報酬設計（既に実装済み）
     print("\n" + "="*80)
     print("[INFO] Training data loaded: {} rows".format(len(ohlc_df)))
-    print("[INFO] High/Low balance will be achieved through:")
-    print("  - Balanced exploration (High 35%, Low 35%, Hold 30%)")
-    print("  - Symmetric reward function")
+    print(f"[INFO] Dedicated {action_label} model: Hold vs {action_label} outputs only")
+    print("  - Balanced exploration between Hold (30%) and action (70%)")
+    print("  - Symmetric reward function shared across modes")
     print("  - Long-term data covering both uptrends and downtrends")
     print("="*80 + "\n")
 
@@ -594,8 +608,8 @@ def train_dqn(ohlc_df, pair=pair, save_dir="./Models",
     reward_history = deque(maxlen=1000)
     
     # エントリー統計
-    entry_stats = {'Hold': 0, 'High': 0, 'Low': 0}
-    reward_stats = {'Hold': [], 'High': [], 'Low': []}
+    entry_stats = {'Hold': 0, action_label: 0}
+    reward_stats = {'Hold': [], action_label: []}
 
     print("[INFO] Starting training...")
     
@@ -647,14 +661,12 @@ def train_dqn(ohlc_df, pair=pair, save_dir="./Models",
                 # ランダム探索時にHigh/Lowのバランスを強制的に取る
                 batch_actions = []
                 for _ in range(len(batch_idxs)):
-                    # Hold:30%, High:35%, Low:35%の確率分布
+                    # Hold:30%, Action:70%の確率分布
                     rand_val = random.random()
                     if rand_val < 0.30:
                         batch_actions.append(0)  # Hold
-                    elif rand_val < 0.65:
-                        batch_actions.append(1)  # High
                     else:
-                        batch_actions.append(2)  # Low
+                        batch_actions.append(1)  # Mode-specific action
                 batch_actions = np.array(batch_actions)
             else:
                 q.eval()
@@ -674,14 +686,14 @@ def train_dqn(ohlc_df, pair=pair, save_dir="./Models",
                 next_close = float(ohlc_df['close'].iloc[i+1])
                 trend_slice = ohlc_df['close'].iloc[max(0, i-window_size):i+1]
                 trend_dir = compute_trend_direction(trend_slice, window=window_size)
-                r = compute_reward(a, next_close, entry_price, trend_dir=trend_dir)
+                real_action = action_id if a == 1 else 0
+                r = compute_reward(real_action, next_close, entry_price, trend_dir=trend_dir)
                 reward_history.append(r)
                 
                 # 統計記録
-                action_names = ['Hold', 'High', 'Low']
-                if 0 <= a < len(action_names):
-                    entry_stats[action_names[a]] += 1
-                    reward_stats[action_names[a]].append(r)
+                stat_key = 'Hold' if a == 0 else action_label
+                entry_stats[stat_key] += 1
+                reward_stats[stat_key].append(r)
                 
                 # 次の状態（事前計算済み、またはその場で計算）
                 if i+1 in pre_computed_states:
@@ -775,35 +787,24 @@ def train_dqn(ohlc_df, pair=pair, save_dir="./Models",
             total_entries = sum(entry_stats.values())
             if total_entries > 0:
                 hold_pct = entry_stats['Hold'] / total_entries * 100
-                high_pct = entry_stats['High'] / total_entries * 100
-                low_pct = entry_stats['Low'] / total_entries * 100
-                
-                # High/Lowバランスの監視と警告
-                if high_pct > 0 or low_pct > 0:
-                    hl_total = entry_stats['High'] + entry_stats['Low']
-                    if hl_total > 0:
-                        high_ratio = entry_stats['High'] / hl_total
-                        low_ratio = entry_stats['Low'] / hl_total
-                        if high_ratio > 0.7 or low_ratio > 0.7:
-                            print(f"[⚠️ IMBALANCE] High/Low比率に偏り - High:{high_ratio*100:.1f}%, Low:{low_ratio*100:.1f}%")
+                action_pct = entry_stats[action_label] / total_entries * 100
             else:
-                hold_pct = high_pct = low_pct = 0
+                hold_pct = action_pct = 0
             
             # 各アクションの平均報酬（最適化）
             avg_reward_hold = np.mean(reward_stats['Hold']) if reward_stats['Hold'] else 0.0
-            avg_reward_high = np.mean(reward_stats['High']) if reward_stats['High'] else 0.0
-            avg_reward_low = np.mean(reward_stats['Low']) if reward_stats['Low'] else 0.0
+            avg_reward_action = np.mean(reward_stats[action_label]) if reward_stats[action_label] else 0.0
             
             # モデル保存（より高速化）
-            torch.save(q.state_dict(), os.path.join(save_dir, "dqn_policy.pt"))
+            torch.save(q.state_dict(), os.path.join(save_dir, model_filename))
             with open(os.path.join(save_dir, "dqn_scaler.pkl"), "wb") as f:
                 pickle.dump(scaler, f)
             print(f"[CKPT] Episode={episode}, Steps={steps}, Eps={eps:.3f}, "
                   f"AvgLoss={avg_loss:.4f}, AvgReward={avg_reward:.4f}")
             print(f"[STATS] エントリー回数 - Hold:{entry_stats['Hold']}({hold_pct:.1f}%), "
-                  f"High:{entry_stats['High']}({high_pct:.1f}%), Low:{entry_stats['Low']}({low_pct:.1f}%)")
+                f"{action_label}:{entry_stats[action_label]}({action_pct:.1f}%)")
             print(f"[REWARDS] 平均報酬 - Hold:{avg_reward_hold:.3f}, "
-                  f"High:{avg_reward_high:.3f}, Low:{avg_reward_low:.3f}")
+                f"{action_label}:{avg_reward_action:.3f}")
             
             # メモリ使用量をチェック（デバッグ用）
             if device.startswith('cuda'):
@@ -812,7 +813,7 @@ def train_dqn(ohlc_df, pair=pair, save_dir="./Models",
                 torch.cuda.empty_cache()
 
     # 最終保存
-    torch.save(q.state_dict(), os.path.join(save_dir, "dqn_policy.pt"))
+    torch.save(q.state_dict(), os.path.join(save_dir, model_filename))
     with open(os.path.join(save_dir, "dqn_scaler.pkl"), "wb") as f:
         pickle.dump(scaler, f)
     
@@ -824,13 +825,10 @@ def train_dqn(ohlc_df, pair=pair, save_dir="./Models",
         print("="*60)
         print(f"Total Actions: {total_entries}")
         print(f"Hold: {entry_stats['Hold']} ({entry_stats['Hold']/total_entries*100:.1f}%)")
-        print(f"High: {entry_stats['High']} ({entry_stats['High']/total_entries*100:.1f}%)")
-        print(f"Low:  {entry_stats['Low']} ({entry_stats['Low']/total_entries*100:.1f}%)")
+        print(f"{action_label}: {entry_stats[action_label]} ({entry_stats[action_label]/total_entries*100:.1f}%)")
         
-        if reward_stats['High']:
-            print(f"Average Reward High: {np.mean(reward_stats['High']):.3f}")
-        if reward_stats['Low']:
-            print(f"Average Reward Low:  {np.mean(reward_stats['Low']):.3f}")
+        if reward_stats[action_label]:
+            print(f"Average Reward {action_label}: {np.mean(reward_stats[action_label]):.3f}")
         if reward_stats['Hold']:
             print(f"Average Reward Hold: {np.mean(reward_stats['Hold']):.3f}")
         print("="*60)
@@ -839,8 +837,8 @@ def train_dqn(ohlc_df, pair=pair, save_dir="./Models",
     clear_feature_cache()
     
     print("[DONE] DQN training completed and saved.")
-    evaluate_dqn_model(q, scaler, ohlc_df, device=device, window_size=window_size)
-def evaluate_dqn_model(q, scaler, ohlc_df, n_eval=2000, device='cpu', window_size=20):
+    evaluate_dqn_model(q, scaler, ohlc_df, device=device, window_size=window_size, target_action=target_action)
+def evaluate_dqn_model(q, scaler, ohlc_df, n_eval=2000, device='cpu', window_size=20, target_action='high'):
     """
     学習済みDQNモデルを使ってOHLCデータ上で勝率、損益、最大ドローダウンを測定
     - q: 学習済み QNet
@@ -849,12 +847,16 @@ def evaluate_dqn_model(q, scaler, ohlc_df, n_eval=2000, device='cpu', window_siz
     - n_eval: 評価に使うサンプル数
     - device: 計算デバイス
     """
+    target_key = str(target_action).lower()
+    if target_key not in ACTION_MODES:
+        raise ValueError(f"Unsupported target_action '{target_action}'. Choose from {list(ACTION_MODES.keys())}.")
+    mode_cfg = ACTION_MODES[target_key]
+    action_label = mode_cfg['label']
+    action_id = mode_cfg['id']
+
     # 全体の統計
     correct, total = 0, 0
-    
-    # 予測別の統計
-    high_correct, high_total = 0, 0  # High予測の統計
-    low_correct, low_total = 0, 0    # Low予測の統計
+    action_correct, action_total = 0, 0
     hold_count = 0                   # Hold回数
     
     profit = 0.0
@@ -908,22 +910,18 @@ def evaluate_dqn_model(q, scaler, ohlc_df, n_eval=2000, device='cpu', window_siz
             entry_price = float(sl['close'].iloc[-1])
             next_close = float(ohlc_df['close'].iloc[i+1])
             trend_dir = compute_trend_direction(sl['close'], window=window_size)
-            r = compute_reward(a, next_close, entry_price, trend_dir=trend_dir)
+            real_action = action_id if a == 1 else 0
+            r = compute_reward(real_action, next_close, entry_price, trend_dir=trend_dir)
 
             # アクション別統計
             if a == 0:  # Hold
                 hold_count += 1
-            elif a == 1:  # High予測
-                high_total += 1
+            elif a == 1:
+                action_total += 1
                 total += 1
-                if next_close > entry_price:  # 上昇したか
-                    high_correct += 1
-                    correct += 1
-            elif a == 2:  # Low予測
-                low_total += 1
-                total += 1
-                if next_close < entry_price:  # 下降したか
-                    low_correct += 1
+                direction_correct = next_close > entry_price if action_id == 1 else next_close < entry_price
+                if direction_correct:
+                    action_correct += 1
                     correct += 1
 
             # 累積損益計算
@@ -936,15 +934,13 @@ def evaluate_dqn_model(q, scaler, ohlc_df, n_eval=2000, device='cpu', window_siz
     acc = correct / total if total > 0 else 0.0
     
     # 予測別の勝率
-    high_acc = high_correct / high_total if high_total > 0 else 0.0
-    low_acc = low_correct / low_total if low_total > 0 else 0.0
+    action_acc = action_correct / action_total if action_total > 0 else 0.0
     
     # 結果表示
     print(f"[EVAL] Overall Accuracy: {acc:.3f} ({correct}/{total})")
-    print(f"[EVAL] High Prediction Accuracy: {high_acc:.3f} ({high_correct}/{high_total})")
-    print(f"[EVAL] Low Prediction Accuracy: {low_acc:.3f} ({low_correct}/{low_total})")
+    print(f"[EVAL] {action_label} Prediction Accuracy: {action_acc:.3f} ({action_correct}/{action_total})")
     print(f"[EVAL] Hold Count: {hold_count}")
-    print(f"[EVAL] Action Distribution - High: {high_total}, Low: {low_total}, Hold: {hold_count}")
+    print(f"[EVAL] Action Distribution - {action_label}: {action_total}, Hold: {hold_count}")
     print(f"[EVAL] Total Profit: {profit:.2f}, Max Drawdown: {max_dd:.2f}")
     
     return acc, profit, max_dd
@@ -1069,10 +1065,14 @@ if __name__ == "__main__":
     print(f"\n[INFO] モデル名: {model_pair_name}")
     print("="*80 + "\n")
     
-    # 学習開始
+    # 学習開始（High/Low専用モデルをそれぞれ学習）
     try:
-        train_dqn(df, pair=model_pair_name)
-        print("[INFO] モデル保存完了")
+        for mode in ACTION_MODES.keys():
+            print("\n" + "="*80)
+            print(f"[INFO] Training {mode.upper()} model")
+            print("="*80)
+            train_dqn(df, pair=model_pair_name, target_action=mode)
+        print("[INFO] 高速DQNモデル2種の保存が完了しました")
     except Exception as e:
         print(f"[ERROR] 学習中にエラーが発生しました: {e}")
         import traceback
