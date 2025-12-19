@@ -74,6 +74,17 @@ if not os.path.exists(LOG_PATH):
             "final_action","entry","reason"
         ])
 
+# 取引パラメータ（仮想通貨/FX共通）
+ASSET_TYPE = os.getenv("ASSET_TYPE", "fx").lower()  # "crypto" or "fx"
+EXIT_HORIZON_MIN = int(os.getenv("EXIT_HORIZON_MIN", "5"))
+TP_PCT = float(os.getenv("TP_PCT", "0.003"))  # 0.3%
+SL_PCT = float(os.getenv("SL_PCT", "0.002"))  # 0.2%
+
+FEE_TABLE = {
+    "crypto": {"entry": 0.0006, "exit": 0.0006, "slippage": 0.0002},
+    "fx": {"entry": 0.0001, "exit": 0.0001, "slippage": 0.00005},
+}
+
 # DQNの閾値（Holdをスキップする／しきい値）
 DQN_Q_MARGIN = 0.0  # Holdとの差でエントリーを抑制したければ正にする
 
@@ -383,6 +394,26 @@ def ticks_to_ohlc(ticks, timeframe_sec=60, max_bars=200):
     ohlc = ohlc.dropna().tail(max_bars).reset_index()
     ohlc = ohlc.rename(columns={'index':'ts'})
     return ohlc[['ts','open','high','low','close','volume']]
+
+
+def _fee_rate(asset_type: str) -> float:
+    cfg = FEE_TABLE.get(str(asset_type).lower(), FEE_TABLE["fx"])
+    return float(cfg.get("entry", 0.0) + cfg.get("exit", 0.0) + cfg.get("slippage", 0.0))
+
+
+def _build_exit_levels(side: str, entry_price: float):
+    tp = entry_price * (1 + TP_PCT) if side == "High" else entry_price * (1 - TP_PCT)
+    sl = entry_price * (1 - SL_PCT) if side == "High" else entry_price * (1 + SL_PCT)
+    deadline = datetime.now() + timedelta(minutes=EXIT_HORIZON_MIN)
+    return tp, sl, deadline
+
+
+def _pnl_with_fee(side: str, entry_price: float, exit_price: float):
+    if side == "High":
+        gross = (exit_price - entry_price) / entry_price
+    else:
+        gross = (entry_price - exit_price) / entry_price
+    return gross - _fee_rate(ASSET_TYPE)
 
 # -----------------------
 # DQN loader (flexible)
@@ -1161,6 +1192,7 @@ with sync_playwright() as p:
     last_entry_time = None
     next_entry_allowed_time = None
     recent_prices = deque(maxlen= int(10 / max(TICK_INTERVAL_SECONDS, 0.001)) + 2)
+    open_position = None  # {'side': 'High'|'Low', 'entry_price': float, 'tp': float, 'sl': float, 'deadline': datetime}
     
     print("\n" + "="*80)
     print("🤖 DQN自動取引BOT - チャート矢印フィルター機能付き")
@@ -1207,6 +1239,33 @@ with sync_playwright() as p:
                 # couldn't parse
                 time.sleep(TICK_INTERVAL_SECONDS)
                 continue
+
+            # 既存ポジションのエグジット判定（TP/SL/時間切れ）
+            if open_position:
+                side = open_position['side']
+                tp = open_position['tp']
+                sl = open_position['sl']
+                deadline = open_position['deadline']
+                exit_reason = None
+
+                if side == "High":
+                    if current_price >= tp:
+                        exit_reason = "tp"
+                    elif current_price <= sl:
+                        exit_reason = "sl"
+                else:
+                    if current_price <= tp:
+                        exit_reason = "tp"
+                    elif current_price >= sl:
+                        exit_reason = "sl"
+
+                if exit_reason is None and datetime.now() >= deadline:
+                    exit_reason = "time"
+
+                if exit_reason:
+                    pnl = _pnl_with_fee(side, open_position['entry_price'], current_price)
+                    print(f"[EXIT] {side} exit {exit_reason} at {current_price:.5f} | PnL(net)={pnl*100:.3f}%")
+                    open_position = None
 
             # ティック蓄積
             all_ticks.append((current_time, current_price))
@@ -1439,7 +1498,11 @@ with sync_playwright() as p:
             # ========================================
 
             # Decide entry based on final_action
-            if final_action == "Hold":
+            if open_position:
+                entry = False
+                reason = "position_open"
+                print(f"[{current_time.strftime('%H:%M:%S')}] 既存ポジション保有中 -> 新規エントリー停止")
+            elif final_action == "Hold":
                 entry = False
                 print(f"[{current_time.strftime('%H:%M:%S')}] Hold")
             else:
@@ -1458,7 +1521,15 @@ with sync_playwright() as p:
                         next_entry_allowed_time = current_time + timedelta(seconds=ENTRY_COOLDOWN_SECONDS)
                         entry = True
                         reason = "entry_executed"
-                        print(f"[ENTRY] ✅ {final_action} at {current_time.strftime('%H:%M:%S')} price={current_price}")
+                        tp, sl, deadline = _build_exit_levels(final_action, current_price)
+                        open_position = {
+                            "side": final_action,
+                            "entry_price": current_price,
+                            "tp": tp,
+                            "sl": sl,
+                            "deadline": deadline,
+                        }
+                        print(f"[ENTRY] ✅ {final_action} at {current_time.strftime('%H:%M:%S')} price={current_price} | TP={tp:.5f} SL={sl:.5f} deadline={deadline.strftime('%H:%M:%S')}")
                     else:
                         reason = "button_not_found"
                         entry = False

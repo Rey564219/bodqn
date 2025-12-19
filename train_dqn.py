@@ -60,6 +60,19 @@ ACTION_MODES = {
     "low": {"label": "Low", "id": 2, "model_name": "dqn_policy_low.pt"},
 }
 
+# 資産タイプ別の手数料・スリッページ（単純化したbps）
+FEE_TABLE = {
+    "crypto": {"entry": 0.0006, "exit": 0.0006, "slippage": 0.0002},  # 0.12% + slippage
+    "fx": {"entry": 0.0001, "exit": 0.0001, "slippage": 0.00005},    # 0.02% + slippage（スプレッド相当）
+}
+
+# デフォルトのエグジット設定（n分後 or TP/SL）
+DEFAULT_EXIT_CONFIG = {
+    "horizon_bars": 5,   # n分後（1分足想定）
+    "tp_pct": 0.003,     # 0.3% 利確
+    "sl_pct": 0.002,     # 0.2% 損切り
+}
+
 class QNet(nn.Module):
     def __init__(self, in_dim, out_dim):
         super().__init__()
@@ -284,96 +297,95 @@ def build_state_batch_parallel(ohlc_data_list, extra_list=None, n_workers=None):
     
     return np.stack(states, axis=0).astype(np.float32)
 
-def compute_reward(entry_action, next_close, entry_price, trend_dir=0.0, market_context=None):
-    if entry_action == 0:  # Hold
-        return 0.0
-    
-    # 価格差を計算（絶対的な勝率最優先設計）
-    price_diff = abs(next_close - entry_price) / entry_price
-    direction_correct = False
-    
-    # 方向判定とパフォーマンス計算
-    if entry_action == 1:  # High予測
-        direction_correct = next_close > entry_price
-        price_change = (next_close - entry_price) / entry_price
-    elif entry_action == 2:  # Low予測
-        direction_correct = next_close < entry_price
-        price_change = (entry_price - next_close) / entry_price
+def _get_fee_rate(asset_type: str) -> float:
+    cfg = FEE_TABLE.get(str(asset_type).lower(), FEE_TABLE["fx"])
+    return float(cfg.get("entry", 0.0) + cfg.get("exit", 0.0) + cfg.get("slippage", 0.0))
+
+
+def simulate_exit(entry_action, entry_price, future_bars, exit_cfg):
+    """TP/SLもしくは時間切れでのエグジット価格を近似計算する。
+    future_bars: DataFrame with columns high/low/close
+    exit_cfg: {horizon_bars, tp_pct, sl_pct}
+    """
+    horizon = max(1, int(exit_cfg.get("horizon_bars", 1)))
+    tp_pct = float(exit_cfg.get("tp_pct", 0.0))
+    sl_pct = float(exit_cfg.get("sl_pct", 0.0))
+
+    if future_bars is None or len(future_bars) == 0:
+        return entry_price, "no_future"
+
+    horizon_slice = future_bars.iloc[:horizon].copy()
+    exit_price = float(horizon_slice['close'].iloc[-1])
+    exit_reason = "time"
+
+    for _, row in horizon_slice.iterrows():
+        high_p = float(row['high'])
+        low_p = float(row['low'])
+        if entry_action == 1:  # High/long
+            tp_price = entry_price * (1 + tp_pct)
+            sl_price = entry_price * (1 - sl_pct)
+            if high_p >= tp_price:
+                exit_price = tp_price
+                exit_reason = "tp"
+                break
+            if low_p <= sl_price:
+                exit_price = sl_price
+                exit_reason = "sl"
+                break
+        elif entry_action == 2:  # Low/short
+            tp_price = entry_price * (1 - tp_pct)
+            sl_price = entry_price * (1 + sl_pct)
+            if low_p <= tp_price:
+                exit_price = tp_price
+                exit_reason = "tp"
+                break
+            if high_p >= sl_price:
+                exit_price = sl_price
+                exit_reason = "sl"
+                break
+
+    return exit_price, exit_reason
+
+
+def compute_reward(entry_action, entry_price, future_bars, trend_dir=0.0, asset_type="fx", exit_cfg=None):
+    """仮想通貨/FX向けに、TP/SL + 時間切れを考慮した報酬を計算する。"""
+    if entry_action == 0:
+        return 0.0, entry_price, "hold"
+
+    if exit_cfg is None:
+        exit_cfg = DEFAULT_EXIT_CONFIG
+
+    exit_price, exit_reason = simulate_exit(entry_action, entry_price, future_bars, exit_cfg)
+
+    if entry_action == 1:
+        gross = (exit_price - entry_price) / entry_price
+    elif entry_action == 2:
+        gross = (entry_price - exit_price) / entry_price
     else:
-        return 0.0
-    
-    # 逆張りを即座に罰する（上昇トレンドでLow、下降トレンドでHigh）
+        return 0.0, entry_price, "unknown_action"
+
+    fee_rate = _get_fee_rate(asset_type)
+    net = gross - fee_rate
+
+    # トレンドと同方向なら軽いボーナス、逆ならペナルティ
+    trend_penalty = 0.0
     trend_threshold = 1e-6
     if entry_action == 1 and trend_dir < -trend_threshold:
-        return -30.0
-    if entry_action == 2 and trend_dir > trend_threshold:
-        return -30.0
+        trend_penalty = 0.001
+    elif entry_action == 2 and trend_dir > trend_threshold:
+        trend_penalty = 0.001
 
-    # 絶対的勝率優先報酬設計（80%+確実達成）
-    if direction_correct:
-        # 成功時：極めて巨大な報酬（勝利を徹底的に強化）
-        if price_diff > 0.005:  # 50pips以上の大幅な動き
-            base_reward = 50.0  # 超巨大報酬
-        elif price_diff > 0.003:  # 30pips以上
-            base_reward = 35.0
-        elif price_diff > 0.002:  # 20pips以上
-            base_reward = 25.0
-        elif price_diff > 0.001:  # 10pips以上
-            base_reward = 20.0
-        elif price_diff > 0.0005:  # 5pips以上
-            base_reward = 15.0
-        else:  # 1pip以上でも大きく評価
-            base_reward = 10.0
-        
-        # 超強力な確実性ボーナス
-        certainty_bonus = min(abs(price_change) * 30000, 15.0)
-        
-        # 絶対勝率ボーナス（全ての勝ちに巨大ボーナス）
-        win_rate_bonus = 10.0
-        
-        # 小さな勝ちでも高く評価する追加ボーナス
-        consistency_bonus = 5.0
-        
-        # Low予測の場合、ボーナスを20%増加（High/Lowバランス調整）
-        if entry_action == 2:  # Low
-            low_balance_bonus = (base_reward + certainty_bonus + win_rate_bonus + consistency_bonus) * 0.15
-            total_reward = base_reward + certainty_bonus + win_rate_bonus + consistency_bonus + low_balance_bonus
-        else:  # High
-            total_reward = base_reward + certainty_bonus + win_rate_bonus + consistency_bonus
-        
-        # 最低でも20.0の報酬を保証
-        return max(total_reward, 20.0)
-    else:
-        # 失敗時：破滅的ペナルティ（負けを完全に排除）
-        if price_diff > 0.005:  # 50pips以上の大幅な逆行
-            penalty = -50.0  # 破滅的ペナルティ
-        elif price_diff > 0.003:  # 30pips以上の逆行
-            penalty = -35.0
-        elif price_diff > 0.002:  # 20pips以上の逆行
-            penalty = -25.0
-        elif price_diff > 0.001:  # 10pips以上の逆行
-            penalty = -20.0
-        else:  # 微小な逆行でも厳しく
-            penalty = -15.0
-        
-        # 追加の破滅的ペナルティ（負けを絶対に許さない）
-        loss_annihilation_penalty = -10.0
-        
-        # 一貫性ペナルティ（負けパターンを徹底排除）
-        consistency_penalty = -5.0
-        
-        total_penalty = penalty + loss_annihilation_penalty + consistency_penalty
-        
-        # 最低でも-20.0のペナルティを保証
-        return min(total_penalty, -20.0)
+    reward = np.clip((net - trend_penalty) * 5000.0, -50.0, 50.0)
+    return float(reward), exit_price, exit_reason
 
 def train_dqn(ohlc_df, pair=pair, save_dir="./Models",
-              gamma=0.9998, lr=2e-6, batch_size=512,  # 超精密学習パラメータ
-              warmup=12000, updates=200000, target_sync=2000,  # 超長期学習
-              epsilon_start=0.99, epsilon_end=0.001, epsilon_decay=100000,  # 超慎重探索
+              gamma=0.9998, lr=2e-6, batch_size=512,
+              warmup=12000, updates=200000, target_sync=2000,
+              epsilon_start=0.99, epsilon_end=0.001, epsilon_decay=100000,
               device='cuda' if torch.cuda.is_available() else 'cpu',
               num_workers=2, max_time_hours=8,
-              target_action='high'):  # 80%勝率確実達成のための学習時間
+              target_action='high', asset_type='fx',
+              exit_horizon=5, tp_pct=0.003, sl_pct=0.002):
     
     # 保存ディレクトリを確実に作成（絶対パスで）
     import os
@@ -399,6 +411,9 @@ def train_dqn(ohlc_df, pair=pair, save_dir="./Models",
     action_label = mode_cfg['label']
     action_id = mode_cfg['id']
     model_filename = mode_cfg['model_name']
+
+    asset_type = str(asset_type).lower()
+    exit_cfg = {"horizon_bars": exit_horizon, "tp_pct": tp_pct, "sl_pct": sl_pct}
 
     print(f"[INFO] Using device: {device}")
     print(f"[INFO] Training dedicated {action_label} model (action id {action_id})")
@@ -559,7 +574,8 @@ def train_dqn(ohlc_df, pair=pair, save_dir="./Models",
     pre_computed_extras = {}
     
     # 計算範囲を制限（最大1000サンプルまで）
-    compute_range = min(1000, len(ohlc_df) - window_size - 1)
+    max_index = len(ohlc_df) - exit_horizon - 1
+    compute_range = min(1000, max(0, max_index - window_size))
     compute_indices = list(range(window_size+1, window_size+1+compute_range))
     
     print(f"[INFO] Computing {len(compute_indices)} states...")
@@ -683,11 +699,20 @@ def train_dqn(ohlc_df, pair=pair, save_dir="./Models",
                 
                 # 価格情報の高速取得
                 entry_price = float(ohlc_df['close'].iloc[i])
-                next_close = float(ohlc_df['close'].iloc[i+1])
+                future_slice = ohlc_df.iloc[i+1:i+1+exit_horizon][['high', 'low', 'close']]
+                if len(future_slice) == 0:
+                    continue  # 未来データ不足
                 trend_slice = ohlc_df['close'].iloc[max(0, i-window_size):i+1]
                 trend_dir = compute_trend_direction(trend_slice, window=window_size)
                 real_action = action_id if a == 1 else 0
-                r = compute_reward(real_action, next_close, entry_price, trend_dir=trend_dir)
+                r, exit_price, exit_reason = compute_reward(
+                    real_action,
+                    entry_price,
+                    future_slice,
+                    trend_dir=trend_dir,
+                    asset_type=asset_type,
+                    exit_cfg=exit_cfg,
+                )
                 reward_history.append(r)
                 
                 # 統計記録
@@ -837,8 +862,21 @@ def train_dqn(ohlc_df, pair=pair, save_dir="./Models",
     clear_feature_cache()
     
     print("[DONE] DQN training completed and saved.")
-    evaluate_dqn_model(q, scaler, ohlc_df, device=device, window_size=window_size, target_action=target_action)
-def evaluate_dqn_model(q, scaler, ohlc_df, n_eval=2000, device='cpu', window_size=20, target_action='high'):
+    evaluate_dqn_model(
+        q,
+        scaler,
+        ohlc_df,
+        device=device,
+        window_size=window_size,
+        target_action=target_action,
+        asset_type=asset_type,
+        exit_horizon=exit_horizon,
+        tp_pct=tp_pct,
+        sl_pct=sl_pct,
+    )
+def evaluate_dqn_model(q, scaler, ohlc_df, n_eval=2000, device='cpu', window_size=20,
+                      target_action='high', asset_type='fx', exit_horizon=5,
+                      tp_pct=0.003, sl_pct=0.002):
     """
     学習済みDQNモデルを使ってOHLCデータ上で勝率、損益、最大ドローダウンを測定
     - q: 学習済み QNet
@@ -854,6 +892,8 @@ def evaluate_dqn_model(q, scaler, ohlc_df, n_eval=2000, device='cpu', window_siz
     action_label = mode_cfg['label']
     action_id = mode_cfg['id']
 
+    exit_cfg = {"horizon_bars": exit_horizon, "tp_pct": tp_pct, "sl_pct": sl_pct}
+
     # 全体の統計
     correct, total = 0, 0
     action_correct, action_total = 0, 0
@@ -862,7 +902,8 @@ def evaluate_dqn_model(q, scaler, ohlc_df, n_eval=2000, device='cpu', window_siz
     profit = 0.0
     max_dd, peak = 0.0, 0.0
 
-    idxs = list(range(window_size+1, min(len(ohlc_df)-1, window_size+1+min(3000, n_eval))))  # より多くのサンプルで評価
+    max_eval_index = len(ohlc_df) - exit_horizon - 1
+    idxs = list(range(window_size+1, min(max_eval_index, window_size+1+min(3000, n_eval))))  # 十分な先行足を確保
     q.eval()
     
     print(f"[INFO] Evaluating model on {len(idxs)} samples...")
@@ -908,10 +949,19 @@ def evaluate_dqn_model(q, scaler, ohlc_df, n_eval=2000, device='cpu', window_siz
         for idx, (i, a) in enumerate(zip(batch_idxs, actions)):
             sl = ohlc_df.iloc[max(0, i-window_size):i+1].copy()
             entry_price = float(sl['close'].iloc[-1])
-            next_close = float(ohlc_df['close'].iloc[i+1])
+            future_slice = ohlc_df.iloc[i+1:i+1+exit_horizon][['high', 'low', 'close']]
+            if len(future_slice) == 0:
+                continue
             trend_dir = compute_trend_direction(sl['close'], window=window_size)
             real_action = action_id if a == 1 else 0
-            r = compute_reward(real_action, next_close, entry_price, trend_dir=trend_dir)
+            r, exit_price, exit_reason = compute_reward(
+                real_action,
+                entry_price,
+                future_slice,
+                trend_dir=trend_dir,
+                asset_type=asset_type,
+                exit_cfg=exit_cfg,
+            )
 
             # アクション別統計
             if a == 0:  # Hold
@@ -924,8 +974,10 @@ def evaluate_dqn_model(q, scaler, ohlc_df, n_eval=2000, device='cpu', window_siz
                     action_correct += 1
                     correct += 1
 
-            # 累積損益計算
-            profit += r
+            # 累積損益計算（実際の値幅ベース）
+            if real_action in (1, 2):
+                net_move = (exit_price - entry_price) / entry_price if real_action == 1 else (entry_price - exit_price) / entry_price
+                profit += net_move - _get_fee_rate(asset_type)
         peak = max(peak, profit)
         dd = peak - profit
         max_dd = max(max_dd, dd)
