@@ -19,12 +19,11 @@ import csv
 import time
 import random
 import pickle
-import threading
 import traceback
 import numpy as np
 import pandas as pd
 from datetime import datetime, timedelta
-from collections import deque
+from typing import Optional
 
 from shared_features import build_state_vec_fast, compute_trend_direction
 
@@ -76,41 +75,23 @@ if not os.path.exists(LOG_PATH):
 
 # 取引パラメータ（仮想通貨/FX共通）
 ASSET_TYPE = os.getenv("ASSET_TYPE", "fx").lower()  # "crypto" or "fx"
-EXIT_HORIZON_MIN = int(os.getenv("EXIT_HORIZON_MIN", "5"))
-TP_PCT = float(os.getenv("TP_PCT", "0.003"))  # 0.3%
-SL_PCT = float(os.getenv("SL_PCT", "0.002"))  # 0.2%
+ENTRY_TH = float(os.getenv("ENTRY_TH", "0.55"))
+ATR_FAST_PERIOD = 14
+ATR_SLOW_PERIOD = 100
+VOL_LOW_TH = 0.8
+VOL_HIGH_TH = 1.3
+MIN_TP_PIPS = 1.5
+MIN_SL_PIPS = 2.0
+N0_HOLD_MIN = 4
+N_MIN_HOLD = 2
+N_MAX_HOLD = 6
+MAX_OHLC_BARS = max(REQUIRED_CANDLES + 20, ATR_SLOW_PERIOD + 10)
 
 FEE_TABLE = {
     "crypto": {"entry": 0.0006, "exit": 0.0006, "slippage": 0.0002},
     "fx": {"entry": 0.0001, "exit": 0.0001, "slippage": 0.00005},
 }
 
-# DQNの閾値（Holdをスキップする／しきい値）
-DQN_Q_MARGIN = 0.0  # Holdとの差でエントリーを抑制したければ正にする
-
-# トレンドフィルター設定（連敗システムは削除）
-# すべての連敗ストッパー機能を削除しました
-
-# ========================================
-# 連敗システム関連（一時的にコメントアウト）
-# ========================================
-# def analyze_price_slope_and_losses(prices, price_times, loss_history):
-#     """価格の傾きと直近の負け履歴を分析する（負けエントリー地点基準版）"""
-#     ... (省略)
-#
-# def apply_slope_and_loss_filter(action_str, q_values, slope_analysis):
-#     """価格傾きと負け履歴に基づくシンプルなフィルター（連敗時3分間ブロック機能付き）"""
-#     ... (省略)
-# ========================================
-
-# -----------------------
-# ========================================
-# 連敗システム関連ここまで
-# ========================================
-
-# -----------------------
-# human-like 操作関数 (Playwright用)
-# -----------------------
 def human_click(element, page):
     try:
         box = element.bounding_box()
@@ -401,15 +382,163 @@ def _fee_rate(asset_type: str) -> float:
     return float(cfg.get("entry", 0.0) + cfg.get("exit", 0.0) + cfg.get("slippage", 0.0))
 
 
-def _build_exit_levels(side: str, entry_price: float):
-    tp = entry_price * (1 + TP_PCT) if side == "High" else entry_price * (1 - TP_PCT)
-    sl = entry_price * (1 - SL_PCT) if side == "High" else entry_price * (1 + SL_PCT)
-    deadline = datetime.now() + timedelta(minutes=EXIT_HORIZON_MIN)
-    return tp, sl, deadline
+def _pip_size_for_pair(pair_name: str, price: Optional[float] = None) -> float:
+    env_pip = os.getenv("PIP_SIZE")
+    if env_pip:
+        try:
+            return float(env_pip)
+        except ValueError:
+            pass
+    if pair_name and "JPY" in pair_name.upper():
+        return 0.01
+    return 0.0001
+
+def _default_spread_pips(pair_name: str) -> float:
+    env_spread = os.getenv("SPREAD_PIPS")
+    if env_spread:
+        try:
+            return float(env_spread)
+        except ValueError:
+            pass
+    return 0.2 if pair_name and "JPY" in pair_name.upper() else 0.8
+
+def calc_atr(df: pd.DataFrame, period: int) -> pd.Series:
+    high = df["high"].astype(float)
+    low = df["low"].astype(float)
+    close = df["close"].astype(float)
+    prev_close = close.shift(1)
+    tr = pd.concat(
+        [
+            (high - low).abs(),
+            (high - prev_close).abs(),
+            (low - prev_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+    return tr.rolling(period, min_periods=period).mean()
+
+def get_vol_regime(atr_fast: float, atr_slow: float) -> str:
+    if not np.isfinite(atr_fast) or not np.isfinite(atr_slow) or atr_slow <= 0:
+        return "MID"
+    r = atr_fast / atr_slow
+    if r < VOL_LOW_TH:
+        return "LOW"
+    if r < VOL_HIGH_TH:
+        return "MID"
+    return "HIGH"
+
+def make_exit_params(
+    atr_fast_pips: float,
+    atr_slow_pips: float,
+    spread_pips: float,
+    min_tp_pips: float = MIN_TP_PIPS,
+    min_sl_pips: float = MIN_SL_PIPS,
+    n0: int = N0_HOLD_MIN,
+    n_min: int = N_MIN_HOLD,
+    n_max: int = N_MAX_HOLD,
+) -> dict:
+    if not np.isfinite(atr_fast_pips) or not np.isfinite(atr_slow_pips) or atr_slow_pips <= 0:
+        return {
+            "trade_allowed": False,
+            "regime": "MID",
+            "tp_pips": min_tp_pips,
+            "sl_pips": min_sl_pips,
+            "max_hold_min": n_max,
+            "r": 0.0,
+        }
+    r = atr_fast_pips / atr_slow_pips
+    regime = get_vol_regime(atr_fast_pips, atr_slow_pips)
+    trade_allowed = atr_fast_pips >= spread_pips * 5.0
+
+    if regime == "LOW":
+        k_tp, k_sl = 0.6, 0.8
+    elif regime == "MID":
+        k_tp, k_sl = 0.8, 1.0
+    else:
+        k_tp, k_sl = 1.0, 1.2
+
+    tp_pips_raw = k_tp * atr_fast_pips
+    sl_pips_raw = k_sl * atr_fast_pips
+    tp_pips = max(tp_pips_raw, spread_pips * 2.5, min_tp_pips)
+    sl_pips = max(sl_pips_raw, spread_pips * 3.0, min_sl_pips)
+
+    n_raw = round(n0 / r) if r > 0 else n_max
+    n = int(min(max(n_raw, n_min), n_max))
+    return {
+        "trade_allowed": trade_allowed,
+        "regime": regime,
+        "tp_pips": float(tp_pips),
+        "sl_pips": float(sl_pips),
+        "max_hold_min": n,
+        "r": float(r),
+    }
+
+def decide_entry_two_models(p_long: float, p_short: float, entry_th: float) -> str:
+    if p_long >= entry_th and p_long > p_short:
+        return "LONG"
+    if p_short >= entry_th and p_short > p_long:
+        return "SHORT"
+    return "HOLD"
+
+def _softmax_probs(q_vals):
+    q = np.array(q_vals, dtype=float)
+    q = q - np.max(q)
+    exp_q = np.exp(q)
+    return exp_q / np.sum(exp_q)
+
+def _get_last_closed_bar(ohlc_df: pd.DataFrame, current_time: datetime):
+    if len(ohlc_df) < 2:
+        return None, None
+    current_minute = current_time.replace(second=0, microsecond=0)
+    last_time = ohlc_df.index[-1].to_pydatetime()
+    if last_time < current_minute:
+        return ohlc_df.iloc[-1], last_time
+    return ohlc_df.iloc[-2], ohlc_df.index[-2].to_pydatetime()
+
+def _build_exit_levels_from_params(side: str, entry_price: float, pip_size: float, exit_params: dict, entry_time: datetime):
+    tp_pips = exit_params["tp_pips"]
+    sl_pips = exit_params["sl_pips"]
+    max_hold = exit_params["max_hold_min"]
+    if side == "LONG":
+        tp = entry_price + tp_pips * pip_size
+        sl = entry_price - sl_pips * pip_size
+    else:
+        tp = entry_price - tp_pips * pip_size
+        sl = entry_price + sl_pips * pip_size
+    timeout_time = entry_time + timedelta(minutes=max_hold)
+    return tp, sl, timeout_time
+
+def check_exit(position: dict, ohlc_row: pd.Series, current_time: datetime):
+    if ohlc_row is None:
+        return False, None
+    side = position["side"]
+    tp_price = position["tp_price"]
+    sl_price = position["sl_price"]
+    timeout_time = position["timeout_time"]
+
+    high = float(ohlc_row["high"])
+    low = float(ohlc_row["low"])
+
+    if side == "LONG":
+        hit_tp = high >= tp_price
+        hit_sl = low <= sl_price
+    else:
+        hit_tp = low <= tp_price
+        hit_sl = high >= sl_price
+
+    if hit_tp and hit_sl:
+        return True, "SL"
+    if hit_sl:
+        return True, "SL"
+    if hit_tp:
+        return True, "TP"
+    if current_time >= timeout_time:
+        return True, "TIMEOUT"
+    return False, None
 
 
 def _pnl_with_fee(side: str, entry_price: float, exit_price: float):
-    if side == "High":
+    if side in ("High", "LONG"):
         gross = (exit_price - entry_price) / entry_price
     else:
         gross = (entry_price - exit_price) / entry_price
@@ -1189,10 +1318,9 @@ with sync_playwright() as p:
     # loss_history = []  # 負け履歴: [(datetime, action_str, result, entry_price), ...] ※連敗システムコメントアウト
     # pending_trades = []  # エントリー待ちの取引: [(entry_time, action_str, entry_price), ...] ※連敗システムコメントアウト
     # recent_trade_outcomes and trading_paused_until are module-level
-    last_entry_time = None
     next_entry_allowed_time = None
-    recent_prices = deque(maxlen= int(10 / max(TICK_INTERVAL_SECONDS, 0.001)) + 2)
-    open_position = None  # {'side': 'High'|'Low', 'entry_price': float, 'tp': float, 'sl': float, 'deadline': datetime}
+    open_position = None  # {'side': 'LONG'|'SHORT', 'entry_price': float, 'tp_price': float, 'sl_price': float, 'timeout_time': datetime}
+    last_exit_check_bar_time = None
     
     print("\n" + "="*80)
     print("🤖 DQN自動取引BOT - チャート矢印フィルター機能付き")
@@ -1240,40 +1368,13 @@ with sync_playwright() as p:
                 time.sleep(TICK_INTERVAL_SECONDS)
                 continue
 
-            # 既存ポジションのエグジット判定（TP/SL/時間切れ）
-            if open_position:
-                side = open_position['side']
-                tp = open_position['tp']
-                sl = open_position['sl']
-                deadline = open_position['deadline']
-                exit_reason = None
-
-                if side == "High":
-                    if current_price >= tp:
-                        exit_reason = "tp"
-                    elif current_price <= sl:
-                        exit_reason = "sl"
-                else:
-                    if current_price <= tp:
-                        exit_reason = "tp"
-                    elif current_price >= sl:
-                        exit_reason = "sl"
-
-                if exit_reason is None and datetime.now() >= deadline:
-                    exit_reason = "time"
-
-                if exit_reason:
-                    pnl = _pnl_with_fee(side, open_position['entry_price'], current_price)
-                    print(f"[EXIT] {side} exit {exit_reason} at {current_price:.5f} | PnL(net)={pnl*100:.3f}%")
-                    open_position = None
+            # exit check moved to bar-close handling
 
             # ティック蓄積
             all_ticks.append((current_time, current_price))
-            recent_prices.append(current_price)
-
             # OHLC生成
             try:
-                ohlc_data = ticks_to_ohlc(all_ticks, timeframe_sec=60, max_bars=REQUIRED_CANDLES+20)
+                ohlc_data = ticks_to_ohlc(all_ticks, timeframe_sec=60, max_bars=MAX_OHLC_BARS)
             except Exception as e:
                 print(f"[WARN] OHLC生成エラー: {e}")
                 time.sleep(TICK_INTERVAL_SECONDS)
@@ -1284,6 +1385,41 @@ with sync_playwright() as p:
                 print(f"\r{current_time.strftime('%H:%M:%S')} - OHLC収集中 ({len(ohlc_data)}/{REQUIRED_CANDLES})", end="")
                 time.sleep(TICK_INTERVAL_SECONDS)
                 continue
+
+            pip_size = _pip_size_for_pair(pair, current_price)
+            spread_pips = _default_spread_pips(pair)
+            atr_fast_series = calc_atr(ohlc_data, ATR_FAST_PERIOD)
+            atr_slow_series = calc_atr(ohlc_data, ATR_SLOW_PERIOD)
+            atr_fast = float(atr_fast_series.iloc[-1]) if len(atr_fast_series) else float("nan")
+            atr_slow = float(atr_slow_series.iloc[-1]) if len(atr_slow_series) else float("nan")
+            atr_fast_pips = atr_fast / pip_size if pip_size > 0 else float("nan")
+            atr_slow_pips = atr_slow / pip_size if pip_size > 0 else float("nan")
+            exit_params = make_exit_params(atr_fast_pips, atr_slow_pips, spread_pips)
+
+            # 既存ポジションのエグジット判定（TP/SL/時間切れ）: 確定足ベース
+            if open_position:
+                last_bar, last_bar_time = _get_last_closed_bar(ohlc_data, current_time)
+                if current_time >= open_position["timeout_time"]:
+                    exit_price = current_price
+                    pnl = _pnl_with_fee(open_position["side"], open_position["entry_price"], exit_price)
+                    print(f"[EXIT] {open_position['side']} exit TIMEOUT at {exit_price:.5f} | PnL(net)={pnl*100:.3f}%")
+                    open_position = None
+                    last_exit_check_bar_time = None
+                    continue
+                if last_bar_time and last_bar_time != last_exit_check_bar_time:
+                    should_close, exit_reason = check_exit(open_position, last_bar, current_time)
+                    last_exit_check_bar_time = last_bar_time
+                    if should_close:
+                        if exit_reason == "TP":
+                            exit_price = open_position["tp_price"]
+                        elif exit_reason == "SL":
+                            exit_price = open_position["sl_price"]
+                        else:
+                            exit_price = float(last_bar["close"])
+                        pnl = _pnl_with_fee(open_position["side"], open_position["entry_price"], exit_price)
+                        print(f"[EXIT] {open_position['side']} exit {exit_reason} at {exit_price:.5f} | PnL(net)={pnl*100:.3f}%")
+                        open_position = None
+                        last_exit_check_bar_time = None
 
             # phase, pseudo-last bar
             phase = 0.0
@@ -1297,7 +1433,7 @@ with sync_playwright() as p:
             # build_state_vec_fast expects train-style OHLCV columns
             trend_dir = 0.0
             try:
-                fea_ohlc = ohlc_data[['open','high','low','close','volume']].copy()
+                fea_ohlc = ohlc_data[['open','high','low','close','volume']].iloc[-REQUIRED_CANDLES:].copy()
                 sec_range = float(fea_ohlc['high'].iloc[-1] - fea_ohlc['low'].iloc[-1])
                 state_vec = build_state_vec_fast(fea_ohlc, phase, sec_range)
                 trend_dir = compute_trend_direction(fea_ohlc)
@@ -1374,53 +1510,51 @@ with sync_playwright() as p:
                         # Highモデル: [Hold, Entry]
                         high_out = high_model(t)
                         high_q = high_out.cpu().numpy().reshape(-1).astype(float)
-                        high_signal = "Entry" if high_q[1] > high_q[0] else "Hold"
+                        high_probs = _softmax_probs(high_q)
+                        p_long = float(high_probs[1])
+                        high_signal = "Entry" if p_long >= ENTRY_TH else "Hold"
                         
                         # Lowモデル: [Hold, Entry]
                         low_model = dqn_models["low"]
                         low_out = low_model(t)
                         low_q = low_out.cpu().numpy().reshape(-1).astype(float)
-                        low_signal = "Entry" if low_q[1] > low_q[0] else "Hold"
+                        low_probs = _softmax_probs(low_q)
+                        p_short = float(low_probs[1])
+                        low_signal = "Entry" if p_short >= ENTRY_TH else "Hold"
                         
                         # Q値の詳細をログ出力
                         print(f"[HIGH Q-VALUES] Hold:{high_q[0]:.4f}, Entry:{high_q[1]:.4f} -> {high_signal}")
                         print(f"[LOW Q-VALUES]  Hold:{low_q[0]:.4f}, Entry:{low_q[1]:.4f} -> {low_signal}")
                         
-                        # デュアルモデルの判定ロジック
-                        # 両方がEntryシグナルを出した場合はHold（保留）
-                        if high_signal == "Entry" and low_signal == "Entry":
+                        if not exit_params.get("trade_allowed", True):
                             final_action = "Hold"
-                            reason = "both_signals_conflict"
-                            print(f"[DECISION] ❗ 両方のモデルがエントリーシグナル -> 保留 (Hold)")
-                        elif high_signal == "Entry":
-                            # Highのみエントリーシグナル
-                            # トレンドフィルターを適用
-                            trend_threshold = 1e-6
-                            if trend_dir < -trend_threshold:
-                                final_action = "Hold"
-                                reason = "high_blocked_by_downtrend"
-                                print(f"[TREND] 下降トレンド検出 -> Highエントリーを抽制")
-                            else:
-                                final_action = "High"
-                                reason = "high_entry_signal"
-                                print(f"[DECISION] ✅ Highエントリーシグナル")
-                        elif low_signal == "Entry":
-                            # Lowのみエントリーシグナル
-                            # トレンドフィルターを適用
-                            trend_threshold = 1e-6
-                            if trend_dir > trend_threshold:
-                                final_action = "Hold"
-                                reason = "low_blocked_by_uptrend"
-                                print(f"[TREND] 上昇トレンド検出 -> Lowエントリーを抽制")
-                            else:
-                                final_action = "Low"
-                                reason = "low_entry_signal"
-                                print(f"[DECISION] ✅ Lowエントリーシグナル")
+                            reason = "no_trade_low_vol"
+                            print("[DECISION] 🚫 低ボラのためエントリー停止")
                         else:
-                            # 両方ともHold
-                            final_action = "Hold"
-                            reason = "both_hold"
-                            print(f"[DECISION] 🔴 両方のモデルがHoldシグナル")
+                            decision = decide_entry_two_models(p_long, p_short, ENTRY_TH)
+                            trend_threshold = 1e-6
+                            if decision == "LONG":
+                                if trend_dir < -trend_threshold:
+                                    final_action = "Hold"
+                                    reason = "long_blocked_by_downtrend"
+                                    print("[TREND] 下降トレンド検出 -> Longエントリー抑制")
+                                else:
+                                    final_action = "LONG"
+                                    reason = "long_entry_signal"
+                                    print("[DECISION] ✅ Longエントリーシグナル")
+                            elif decision == "SHORT":
+                                if trend_dir > trend_threshold:
+                                    final_action = "Hold"
+                                    reason = "short_blocked_by_uptrend"
+                                    print("[TREND] 上昇トレンド検出 -> Shortエントリー抑制")
+                                else:
+                                    final_action = "SHORT"
+                                    reason = "short_entry_signal"
+                                    print("[DECISION] ✅ Shortエントリーシグナル")
+                            else:
+                                final_action = "Hold"
+                                reason = "both_hold"
+                                print("[DECISION] 🔴 両方のモデルがHoldシグナル")
                     
                 except Exception as e:
                     print(f"[WARN] モデル推論失敗: {e}")
@@ -1513,27 +1647,30 @@ with sync_playwright() as p:
                     print(f"[{current_time.strftime('%H:%M:%S')}] {final_action} - クールダウン中 (残り{(next_entry_allowed_time-current_time).total_seconds():.1f}秒)")
                 else:
                     # execute entry
-                    sel = '.invest-btn-up.button' if final_action == "High" else '.invest-btn-down.button'
+                    button_side = "High" if final_action == "LONG" else "Low"
+                    sel = '.invest-btn-up.button' if button_side == "High" else '.invest-btn-down.button'
                     btn = page.query_selector(sel)
                     if btn:
                         human_click(btn, page)
-                        last_entry_time = current_time
                         next_entry_allowed_time = current_time + timedelta(seconds=ENTRY_COOLDOWN_SECONDS)
                         entry = True
                         reason = "entry_executed"
-                        tp, sl, deadline = _build_exit_levels(final_action, current_price)
+                        tp, sl, timeout_time = _build_exit_levels_from_params(final_action, current_price, pip_size, exit_params, current_time)
                         open_position = {
                             "side": final_action,
                             "entry_price": current_price,
-                            "tp": tp,
-                            "sl": sl,
-                            "deadline": deadline,
+                            "tp_price": tp,
+                            "sl_price": sl,
+                            "timeout_time": timeout_time,
+                            "entry_time": current_time,
+                            "regime": exit_params.get("regime"),
+                            "r": exit_params.get("r"),
                         }
-                        print(f"[ENTRY] ✅ {final_action} at {current_time.strftime('%H:%M:%S')} price={current_price} | TP={tp:.5f} SL={sl:.5f} deadline={deadline.strftime('%H:%M:%S')}")
+                        print(f"[ENTRY] ✅ {final_action} at {current_time.strftime('%H:%M:%S')} price={current_price} | TP={tp:.5f} SL={sl:.5f} timeout={timeout_time.strftime('%H:%M:%S')}")
                     else:
                         reason = "button_not_found"
                         entry = False
-                        print(f"[WARN] {final_action}ボタンが見つかりません")
+                        print(f"[WARN] {button_side}ボタンが見つかりません")
 
             # log
             _log_signal(current_time, current_price, phase, high_q, low_q, high_signal, low_signal, final_action, entry, reason)

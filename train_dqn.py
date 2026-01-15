@@ -19,6 +19,7 @@ import gc
 gc.set_threshold(700, 10, 10)  # GCをより積極的に実行
 
 import pickle, random, math
+from typing import Optional
 import numpy as np
 import pandas as pd
 
@@ -31,7 +32,7 @@ warnings.filterwarnings('ignore', category=FutureWarning)
 np.seterr(all='ignore')  # 警告を無効化
 pd.options.mode.chained_assignment = None  # SettingWithCopyWarningを無効化
 
-import torch, torch.nn as nn, torch.optim as optim
+import torch, torch.nn as nn
 
 # PyTorch最適化設定
 torch.set_num_threads(min(8, os.cpu_count()))
@@ -40,10 +41,8 @@ torch.backends.cudnn.deterministic = False  # 速度優先
 
 from collections import deque
 from sklearn.preprocessing import StandardScaler
-from sklearn.model_selection import train_test_split
 import torch.nn.functional as F
 from concurrent.futures import ThreadPoolExecutor
-import multiprocessing as mp
 
 from shared_features import (
     FeatureExtraction,
@@ -69,9 +68,141 @@ FEE_TABLE = {
 # デフォルトのエグジット設定（n分後 or TP/SL）
 DEFAULT_EXIT_CONFIG = {
     "horizon_bars": 5,   # n分後（1分足想定）
-    "tp_pct": 0.003,     # 0.3% 利確
-    "sl_pct": 0.002,     # 0.2% 損切り
 }
+
+ATR_FAST_PERIOD = 14
+ATR_SLOW_PERIOD = 100
+VOL_LOW_TH = 0.8
+VOL_HIGH_TH = 1.3
+MIN_TP_PIPS = 1.5
+MIN_SL_PIPS = 2.0
+N0_HOLD_MIN = 4
+N_MIN_HOLD = 2
+N_MAX_HOLD = 6
+
+def _pip_size_for_pair(pair_name: str, price: Optional[float] = None) -> float:
+    env_pip = os.getenv("PIP_SIZE")
+    if env_pip:
+        try:
+            return float(env_pip)
+        except ValueError:
+            pass
+    if pair_name and "JPY" in pair_name.upper():
+        return 0.01
+    return 0.0001
+
+def _default_spread_pips(pair_name: str) -> float:
+    env_spread = os.getenv("SPREAD_PIPS")
+    if env_spread:
+        try:
+            return float(env_spread)
+        except ValueError:
+            pass
+    return 0.2 if pair_name and "JPY" in pair_name.upper() else 0.8
+
+def calc_atr(df: pd.DataFrame, period: int) -> pd.Series:
+    high = df["high"].astype(float)
+    low = df["low"].astype(float)
+    close = df["close"].astype(float)
+    prev_close = close.shift(1)
+    tr = pd.concat(
+        [
+            (high - low).abs(),
+            (high - prev_close).abs(),
+            (low - prev_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+    return tr.rolling(period, min_periods=period).mean()
+
+def get_vol_regime(atr_fast: float, atr_slow: float) -> str:
+    if not np.isfinite(atr_fast) or not np.isfinite(atr_slow) or atr_slow <= 0:
+        return "MID"
+    r = atr_fast / atr_slow
+    if r < VOL_LOW_TH:
+        return "LOW"
+    if r < VOL_HIGH_TH:
+        return "MID"
+    return "HIGH"
+
+def make_exit_params(
+    atr_fast_pips: float,
+    atr_slow_pips: float,
+    spread_pips: float,
+    min_tp_pips: float = MIN_TP_PIPS,
+    min_sl_pips: float = MIN_SL_PIPS,
+    n0: int = N0_HOLD_MIN,
+    n_min: int = N_MIN_HOLD,
+    n_max: int = N_MAX_HOLD,
+) -> dict:
+    if not np.isfinite(atr_fast_pips) or not np.isfinite(atr_slow_pips) or atr_slow_pips <= 0:
+        return {
+            "trade_allowed": False,
+            "regime": "MID",
+            "tp_pips": min_tp_pips,
+            "sl_pips": min_sl_pips,
+            "max_hold_min": n_max,
+            "r": 0.0,
+        }
+    r = atr_fast_pips / atr_slow_pips
+    regime = get_vol_regime(atr_fast_pips, atr_slow_pips)
+    trade_allowed = atr_fast_pips >= spread_pips * 5.0
+
+    if regime == "LOW":
+        k_tp, k_sl = 0.6, 0.8
+    elif regime == "MID":
+        k_tp, k_sl = 0.8, 1.0
+    else:
+        k_tp, k_sl = 1.0, 1.2
+
+    tp_pips_raw = k_tp * atr_fast_pips
+    sl_pips_raw = k_sl * atr_fast_pips
+    tp_pips = max(tp_pips_raw, spread_pips * 2.5, min_tp_pips)
+    sl_pips = max(sl_pips_raw, spread_pips * 3.0, min_sl_pips)
+
+    n_raw = round(n0 / r) if r > 0 else n_max
+    n = int(min(max(n_raw, n_min), n_max))
+    return {
+        "trade_allowed": trade_allowed,
+        "regime": regime,
+        "tp_pips": float(tp_pips),
+        "sl_pips": float(sl_pips),
+        "max_hold_min": n,
+        "r": float(r),
+    }
+
+def decide_entry_two_models(p_long: float, p_short: float, entry_th: float) -> str:
+    if p_long >= entry_th and p_long > p_short:
+        return "LONG"
+    if p_short >= entry_th and p_short > p_long:
+        return "SHORT"
+    return "HOLD"
+
+def check_exit(position: dict, ohlc: dict, current_time: datetime):
+    side = position.get("side")
+    tp_price = position.get("tp_price")
+    sl_price = position.get("sl_price")
+    timeout_time = position.get("timeout_time")
+
+    high = float(ohlc.get("high"))
+    low = float(ohlc.get("low"))
+
+    if side == "LONG":
+        hit_tp = high >= tp_price
+        hit_sl = low <= sl_price
+    else:
+        hit_tp = low <= tp_price
+        hit_sl = high >= sl_price
+
+    if hit_tp and hit_sl:
+        return True, "SL"
+    if hit_sl:
+        return True, "SL"
+    if hit_tp:
+        return True, "TP"
+    if current_time >= timeout_time:
+        return True, "TIMEOUT"
+    return False, None
 
 class QNet(nn.Module):
     def __init__(self, in_dim, out_dim):
@@ -302,14 +433,14 @@ def _get_fee_rate(asset_type: str) -> float:
     return float(cfg.get("entry", 0.0) + cfg.get("exit", 0.0) + cfg.get("slippage", 0.0))
 
 
-def simulate_exit(entry_action, entry_price, future_bars, exit_cfg):
+def simulate_exit(entry_action, entry_price, future_bars, exit_params, pip_size):
     """TP/SLもしくは時間切れでのエグジット価格を近似計算する。
     future_bars: DataFrame with columns high/low/close
-    exit_cfg: {horizon_bars, tp_pct, sl_pct}
+    exit_params: {tp_pips, sl_pips, max_hold_min}
     """
-    horizon = max(1, int(exit_cfg.get("horizon_bars", 1)))
-    tp_pct = float(exit_cfg.get("tp_pct", 0.0))
-    sl_pct = float(exit_cfg.get("sl_pct", 0.0))
+    horizon = max(1, int(exit_params.get("max_hold_min", 1)))
+    tp_pips = float(exit_params.get("tp_pips", 0.0))
+    sl_pips = float(exit_params.get("sl_pips", 0.0))
 
     if future_bars is None or len(future_bars) == 0:
         return entry_price, "no_future"
@@ -321,41 +452,52 @@ def simulate_exit(entry_action, entry_price, future_bars, exit_cfg):
     for _, row in horizon_slice.iterrows():
         high_p = float(row['high'])
         low_p = float(row['low'])
-        if entry_action == 1:  # High/long
-            tp_price = entry_price * (1 + tp_pct)
-            sl_price = entry_price * (1 - sl_pct)
-            if high_p >= tp_price:
-                exit_price = tp_price
-                exit_reason = "tp"
-                break
-            if low_p <= sl_price:
-                exit_price = sl_price
-                exit_reason = "sl"
-                break
-        elif entry_action == 2:  # Low/short
-            tp_price = entry_price * (1 - tp_pct)
-            sl_price = entry_price * (1 + sl_pct)
-            if low_p <= tp_price:
-                exit_price = tp_price
-                exit_reason = "tp"
-                break
-            if high_p >= sl_price:
-                exit_price = sl_price
-                exit_reason = "sl"
-                break
+        if entry_action == 1:  # Long
+            tp_price = entry_price + tp_pips * pip_size
+            sl_price = entry_price - sl_pips * pip_size
+            hit_tp = high_p >= tp_price
+            hit_sl = low_p <= sl_price
+        elif entry_action == 2:  # Short
+            tp_price = entry_price - tp_pips * pip_size
+            sl_price = entry_price + sl_pips * pip_size
+            hit_tp = low_p <= tp_price
+            hit_sl = high_p >= sl_price
+        else:
+            continue
+
+        if hit_tp and hit_sl:
+            exit_price = sl_price
+            exit_reason = "sl"
+            break
+        if hit_sl:
+            exit_price = sl_price
+            exit_reason = "sl"
+            break
+        if hit_tp:
+            exit_price = tp_price
+            exit_reason = "tp"
+            break
 
     return exit_price, exit_reason
 
 
-def compute_reward(entry_action, entry_price, future_bars, trend_dir=0.0, asset_type="fx", exit_cfg=None):
+def compute_reward(entry_action, entry_price, future_bars, trend_dir=0.0, asset_type="fx", exit_params=None, pip_size=0.0001, spread_pips=0.0):
     """仮想通貨/FX向けに、TP/SL + 時間切れを考慮した報酬を計算する。"""
     if entry_action == 0:
         return 0.0, entry_price, "hold"
 
-    if exit_cfg is None:
-        exit_cfg = DEFAULT_EXIT_CONFIG
+    if exit_params is None:
+        exit_params = {
+            "trade_allowed": True,
+            "tp_pips": 0.0,
+            "sl_pips": 0.0,
+            "max_hold_min": DEFAULT_EXIT_CONFIG["horizon_bars"],
+        }
 
-    exit_price, exit_reason = simulate_exit(entry_action, entry_price, future_bars, exit_cfg)
+    if not exit_params.get("trade_allowed", True):
+        return 0.0, entry_price, "no_trade"
+
+    exit_price, exit_reason = simulate_exit(entry_action, entry_price, future_bars, exit_params, pip_size)
 
     if entry_action == 1:
         gross = (exit_price - entry_price) / entry_price
@@ -365,7 +507,8 @@ def compute_reward(entry_action, entry_price, future_bars, trend_dir=0.0, asset_
         return 0.0, entry_price, "unknown_action"
 
     fee_rate = _get_fee_rate(asset_type)
-    net = gross - fee_rate
+    spread_cost = (spread_pips * pip_size) / entry_price if spread_pips > 0 else 0.0
+    net = gross - fee_rate - spread_cost
 
     # トレンドと同方向なら軽いボーナス、逆ならペナルティ
     trend_penalty = 0.0
@@ -378,14 +521,60 @@ def compute_reward(entry_action, entry_price, future_bars, trend_dir=0.0, asset_
     reward = np.clip((net - trend_penalty) * 5000.0, -50.0, 50.0)
     return float(reward), exit_price, exit_reason
 
+def simulate_exit_stats(entry_action, entry_price, future_bars, exit_params, pip_size):
+    horizon = max(1, int(exit_params.get("max_hold_min", 1)))
+    tp_pips = float(exit_params.get("tp_pips", 0.0))
+    sl_pips = float(exit_params.get("sl_pips", 0.0))
+
+    if future_bars is None or len(future_bars) == 0:
+        return entry_price, "no_future", 0
+
+    horizon_slice = future_bars.iloc[:horizon].copy()
+    exit_price = float(horizon_slice['close'].iloc[-1])
+    exit_reason = "time"
+    bars_held = len(horizon_slice)
+
+    for idx, row in enumerate(horizon_slice.itertuples(index=False), start=1):
+        high_p = float(row.high)
+        low_p = float(row.low)
+        if entry_action == 1:  # Long
+            tp_price = entry_price + tp_pips * pip_size
+            sl_price = entry_price - sl_pips * pip_size
+            hit_tp = high_p >= tp_price
+            hit_sl = low_p <= sl_price
+        elif entry_action == 2:  # Short
+            tp_price = entry_price - tp_pips * pip_size
+            sl_price = entry_price + sl_pips * pip_size
+            hit_tp = low_p <= tp_price
+            hit_sl = high_p >= sl_price
+        else:
+            continue
+
+        if hit_tp and hit_sl:
+            exit_price = sl_price
+            exit_reason = "sl"
+            bars_held = idx
+            break
+        if hit_sl:
+            exit_price = sl_price
+            exit_reason = "sl"
+            bars_held = idx
+            break
+        if hit_tp:
+            exit_price = tp_price
+            exit_reason = "tp"
+            bars_held = idx
+            break
+
+    return exit_price, exit_reason, bars_held
+
 def train_dqn(ohlc_df, pair=pair, save_dir="./Models",
               gamma=0.9998, lr=2e-6, batch_size=512,
               warmup=12000, updates=200000, target_sync=2000,
               epsilon_start=0.99, epsilon_end=0.001, epsilon_decay=100000,
               device='cuda' if torch.cuda.is_available() else 'cpu',
               num_workers=2, max_time_hours=8,
-              target_action='high', asset_type='fx',
-              exit_horizon=5, tp_pct=0.003, sl_pct=0.002):
+              target_action='high', asset_type='fx'):
     
     # 保存ディレクトリを確実に作成（絶対パスで）
     import os
@@ -413,7 +602,9 @@ def train_dqn(ohlc_df, pair=pair, save_dir="./Models",
     model_filename = mode_cfg['model_name']
 
     asset_type = str(asset_type).lower()
-    exit_cfg = {"horizon_bars": exit_horizon, "tp_pct": tp_pct, "sl_pct": sl_pct}
+    pip_size = _pip_size_for_pair(pair)
+    spread_pips = _default_spread_pips(pair)
+    max_exit_horizon = N_MAX_HOLD
 
     print(f"[INFO] Using device: {device}")
     print(f"[INFO] Training dedicated {action_label} model (action id {action_id})")
@@ -424,6 +615,8 @@ def train_dqn(ohlc_df, pair=pair, save_dir="./Models",
     max_time_seconds = max_time_hours * 3600
     
     ohlc_df = ohlc_df[['open','high','low','close']].copy()
+    atr_fast_series = calc_atr(ohlc_df, ATR_FAST_PERIOD)
+    atr_slow_series = calc_atr(ohlc_df, ATR_SLOW_PERIOD)
     
     # 全データを使用（上限なし）
     print(f"[INFO] Using all {len(ohlc_df)} rows for training")
@@ -574,7 +767,7 @@ def train_dqn(ohlc_df, pair=pair, save_dir="./Models",
     pre_computed_extras = {}
     
     # 計算範囲を制限（最大1000サンプルまで）
-    max_index = len(ohlc_df) - exit_horizon - 1
+    max_index = len(ohlc_df) - max_exit_horizon - 1
     compute_range = min(1000, max(0, max_index - window_size))
     compute_indices = list(range(window_size+1, window_size+1+compute_range))
     
@@ -699,7 +892,10 @@ def train_dqn(ohlc_df, pair=pair, save_dir="./Models",
                 
                 # 価格情報の高速取得
                 entry_price = float(ohlc_df['close'].iloc[i])
-                future_slice = ohlc_df.iloc[i+1:i+1+exit_horizon][['high', 'low', 'close']]
+                atr_fast_pips = float(atr_fast_series.iloc[i]) / pip_size
+                atr_slow_pips = float(atr_slow_series.iloc[i]) / pip_size
+                exit_params = make_exit_params(atr_fast_pips, atr_slow_pips, spread_pips)
+                future_slice = ohlc_df.iloc[i+1:i+1+exit_params["max_hold_min"]][['high', 'low', 'close']]
                 if len(future_slice) == 0:
                     continue  # 未来データ不足
                 trend_slice = ohlc_df['close'].iloc[max(0, i-window_size):i+1]
@@ -711,7 +907,9 @@ def train_dqn(ohlc_df, pair=pair, save_dir="./Models",
                     future_slice,
                     trend_dir=trend_dir,
                     asset_type=asset_type,
-                    exit_cfg=exit_cfg,
+                    exit_params=exit_params,
+                    pip_size=pip_size,
+                    spread_pips=spread_pips,
                 )
                 reward_history.append(r)
                 
@@ -870,13 +1068,10 @@ def train_dqn(ohlc_df, pair=pair, save_dir="./Models",
         window_size=window_size,
         target_action=target_action,
         asset_type=asset_type,
-        exit_horizon=exit_horizon,
-        tp_pct=tp_pct,
-        sl_pct=sl_pct,
+        pair=pair,
     )
 def evaluate_dqn_model(q, scaler, ohlc_df, n_eval=2000, device='cpu', window_size=20,
-                      target_action='high', asset_type='fx', exit_horizon=5,
-                      tp_pct=0.003, sl_pct=0.002):
+                      target_action='high', asset_type='fx', pair=pair):
     """
     学習済みDQNモデルを使ってOHLCデータ上で勝率、損益、最大ドローダウンを測定
     - q: 学習済み QNet
@@ -892,7 +1087,10 @@ def evaluate_dqn_model(q, scaler, ohlc_df, n_eval=2000, device='cpu', window_siz
     action_label = mode_cfg['label']
     action_id = mode_cfg['id']
 
-    exit_cfg = {"horizon_bars": exit_horizon, "tp_pct": tp_pct, "sl_pct": sl_pct}
+    pip_size = _pip_size_for_pair(pair)
+    spread_pips = _default_spread_pips(pair)
+    atr_fast_series = calc_atr(ohlc_df, ATR_FAST_PERIOD)
+    atr_slow_series = calc_atr(ohlc_df, ATR_SLOW_PERIOD)
 
     # 全体の統計
     correct, total = 0, 0
@@ -901,8 +1099,15 @@ def evaluate_dqn_model(q, scaler, ohlc_df, n_eval=2000, device='cpu', window_siz
     
     profit = 0.0
     max_dd, peak = 0.0, 0.0
+    trade_pnls = []
+    trade_holds = []
+    regime_stats = {
+        "LOW": {"pnl": 0.0, "wins": 0, "trades": 0},
+        "MID": {"pnl": 0.0, "wins": 0, "trades": 0},
+        "HIGH": {"pnl": 0.0, "wins": 0, "trades": 0},
+    }
 
-    max_eval_index = len(ohlc_df) - exit_horizon - 1
+    max_eval_index = len(ohlc_df) - N_MAX_HOLD - 1
     idxs = list(range(window_size+1, min(max_eval_index, window_size+1+min(3000, n_eval))))  # 十分な先行足を確保
     q.eval()
     
@@ -949,18 +1154,20 @@ def evaluate_dqn_model(q, scaler, ohlc_df, n_eval=2000, device='cpu', window_siz
         for idx, (i, a) in enumerate(zip(batch_idxs, actions)):
             sl = ohlc_df.iloc[max(0, i-window_size):i+1].copy()
             entry_price = float(sl['close'].iloc[-1])
-            future_slice = ohlc_df.iloc[i+1:i+1+exit_horizon][['high', 'low', 'close']]
+            atr_fast_pips = float(atr_fast_series.iloc[i]) / pip_size
+            atr_slow_pips = float(atr_slow_series.iloc[i]) / pip_size
+            exit_params = make_exit_params(atr_fast_pips, atr_slow_pips, spread_pips)
+            future_slice = ohlc_df.iloc[i+1:i+1+exit_params["max_hold_min"]][['high', 'low', 'close']]
             if len(future_slice) == 0:
                 continue
             trend_dir = compute_trend_direction(sl['close'], window=window_size)
             real_action = action_id if a == 1 else 0
-            r, exit_price, exit_reason = compute_reward(
+            exit_price, exit_reason, bars_held = simulate_exit_stats(
                 real_action,
                 entry_price,
                 future_slice,
-                trend_dir=trend_dir,
-                asset_type=asset_type,
-                exit_cfg=exit_cfg,
+                exit_params,
+                pip_size,
             )
 
             # アクション別統計
@@ -975,9 +1182,19 @@ def evaluate_dqn_model(q, scaler, ohlc_df, n_eval=2000, device='cpu', window_siz
                     correct += 1
 
             # 累積損益計算（実際の値幅ベース）
-            if real_action in (1, 2):
+            if real_action in (1, 2) and exit_params.get("trade_allowed", True):
                 net_move = (exit_price - entry_price) / entry_price if real_action == 1 else (entry_price - exit_price) / entry_price
-                profit += net_move - _get_fee_rate(asset_type)
+                spread_cost = (spread_pips * pip_size) / entry_price if spread_pips > 0 else 0.0
+                net_move = net_move - _get_fee_rate(asset_type) - spread_cost
+                profit += net_move
+                trade_pnls.append(net_move)
+                trade_holds.append(bars_held)
+                regime_key = exit_params.get("regime", "MID")
+                if regime_key in regime_stats:
+                    regime_stats[regime_key]["pnl"] += net_move
+                    regime_stats[regime_key]["trades"] += 1
+                    if net_move > 0:
+                        regime_stats[regime_key]["wins"] += 1
         peak = max(peak, profit)
         dd = peak - profit
         max_dd = max(max_dd, dd)
@@ -987,13 +1204,30 @@ def evaluate_dqn_model(q, scaler, ohlc_df, n_eval=2000, device='cpu', window_siz
     
     # 予測別の勝率
     action_acc = action_correct / action_total if action_total > 0 else 0.0
+    total_trades = len(trade_pnls)
+    wins = sum(1 for p in trade_pnls if p > 0)
+    win_rate = wins / total_trades if total_trades > 0 else 0.0
+    gross_profit = sum(p for p in trade_pnls if p > 0)
+    gross_loss = abs(sum(p for p in trade_pnls if p < 0))
+    profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else float('inf')
+    avg_hold = float(np.mean(trade_holds)) if trade_holds else 0.0
     
     # 結果表示
     print(f"[EVAL] Overall Accuracy: {acc:.3f} ({correct}/{total})")
     print(f"[EVAL] {action_label} Prediction Accuracy: {action_acc:.3f} ({action_correct}/{action_total})")
     print(f"[EVAL] Hold Count: {hold_count}")
     print(f"[EVAL] Action Distribution - {action_label}: {action_total}, Hold: {hold_count}")
-    print(f"[EVAL] Total Profit: {profit:.2f}, Max Drawdown: {max_dd:.2f}")
+    print(f"[EVAL] Total Profit: {profit:.5f}, Max Drawdown: {max_dd:.5f}")
+    print(f"[EVAL] Profit Factor: {profit_factor:.3f}")
+    print(f"[EVAL] Win Rate: {win_rate:.3f} ({wins}/{total_trades})")
+    print(f"[EVAL] Trades: {total_trades}, Avg Hold (min): {avg_hold:.2f}")
+    print("[EVAL] Regime Stats:")
+    for key in ("LOW", "MID", "HIGH"):
+        stats = regime_stats[key]
+        trades = stats["trades"]
+        wins_r = stats["wins"]
+        win_r = wins_r / trades if trades > 0 else 0.0
+        print(f"  - {key}: Trades={trades}, WinRate={win_r:.3f}, PnL={stats['pnl']:.5f}")
     
     return acc, profit, max_dd
 
@@ -1129,4 +1363,3 @@ if __name__ == "__main__":
         print(f"[ERROR] 学習中にエラーが発生しました: {e}")
         import traceback
         traceback.print_exc()
-
