@@ -37,6 +37,9 @@ class PositionState:
     sl_price: float
     timeout_time: datetime
     entry_time: datetime
+    regime_id: Optional[str] = None
+    position_id: Optional[int] = None
+    volume_units: int = 0
 
 
 def calc_atr(df: pd.DataFrame, period: int) -> pd.Series:

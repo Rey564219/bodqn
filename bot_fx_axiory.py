@@ -4,7 +4,7 @@ import os
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Optional
+from typing import List, Optional
 
 import pandas as pd
 import torch
@@ -16,9 +16,7 @@ from trade_core import (
     build_exit_levels,
     calc_atr,
     calc_fx_lots_fixed_risk,
-    decide_entry_two_models,
     make_exit_params,
-    softmax_probs,
 )
 
 try:
@@ -54,7 +52,8 @@ except Exception as e:  # pragma: no cover
     ) from e
 
 try:
-    from shared_features import build_state_vec_fast, compute_trend_direction
+from shared_features import compute_trend_direction
+from regime_executor import MeanReversionTrigger, RegimeDecision, RegimeDecider, RiskManager
 except Exception as e:  # pragma: no cover
     raise SystemExit(
         "shared_features is required for feature extraction."
@@ -81,6 +80,18 @@ CTRADER_ACCESS_TOKEN = os.getenv("CTRADER_ACCESS_TOKEN", "")
 CTRADER_ACCOUNT_ID = os.getenv("CTRADER_ACCOUNT_ID", "")
 CTRADER_HOST_TYPE = os.getenv("CTRADER_HOST_TYPE", "live").lower()
 CTRADER_SYMBOL = os.getenv("CTRADER_SYMBOL", "USDJPY")
+
+TH_LONG = float(os.getenv("TH_LONG", str(ENTRY_TH)))
+TH_SHORT = float(os.getenv("TH_SHORT", str(ENTRY_TH)))
+MAX_POSITIONS_PER_SIDE = int(os.getenv("MAX_POSITIONS_PER_SIDE", "2"))
+MAX_ENTRIES_PER_MINUTE = int(os.getenv("MAX_ENTRIES_PER_MINUTE", "3"))
+REGIME_LOSS_LIMIT = float(os.getenv("REGIME_LOSS_LIMIT", "0.004"))
+DAILY_LOSS_LIMIT = float(os.getenv("DAILY_LOSS_LIMIT", "0.02"))
+CONSECUTIVE_LOSS_LIMIT = int(os.getenv("CONSECUTIVE_LOSS_LIMIT", "3"))
+MEAN_REV_FAST = int(os.getenv("MEAN_REV_FAST", "8"))
+MEAN_REV_SLOW = int(os.getenv("MEAN_REV_SLOW", "34"))
+MEAN_REV_DEV_PIPS = float(os.getenv("MEAN_REV_DEV_PIPS", "0.35"))
+LOWER_TRIGGER_COOLDOWN = float(os.getenv("LOWER_TRIGGER_COOLDOWN", "5"))
 
 
 @dataclass
@@ -116,11 +127,36 @@ class AxioryCTraderBot:
         self.last_bar_time: Optional[datetime] = None
         self.last_trendbar_request = 0.0
 
-        self.open_position = None
-        self.pending_exit_params: Optional[ExitParams] = None
+        self.open_positions: List[PositionState] = []
+        self.active_regime: Optional[RegimeDecision] = None
+        self.last_regime_timestamp: Optional[datetime] = None
+        self.trigger_engine = MeanReversionTrigger(
+            fast_window=MEAN_REV_FAST,
+            slow_window=MEAN_REV_SLOW,
+            deviation_pips=MEAN_REV_DEV_PIPS,
+        )
+        self.risk_manager = RiskManager(
+            max_positions_per_side=MAX_POSITIONS_PER_SIDE,
+            max_entries_per_minute=MAX_ENTRIES_PER_MINUTE,
+            entry_cooldown_seconds=LOWER_TRIGGER_COOLDOWN,
+            per_regime_loss_limit=REGIME_LOSS_LIMIT,
+            daily_loss_limit=DAILY_LOSS_LIMIT,
+            consecutive_loss_limit=CONSECUTIVE_LOSS_LIMIT,
+            max_spread_pips=SPREAD_PIPS * 2,
+        )
+        self.regime_decider: Optional[RegimeDecider] = None
 
         self.scaler = self._load_scaler()
         self.models = self._load_models()
+        if self.scaler and self.models:
+            self.regime_decider = RegimeDecider(
+                scaler=self.scaler,
+                long_model=self.models["long"],
+                short_model=self.models["short"],
+                required_candles=REQUIRED_CANDLES,
+                th_buy=TH_LONG,
+                th_sell=TH_SHORT,
+            )
 
     def _load_scaler(self):
         import pickle
@@ -301,48 +337,83 @@ class AxioryCTraderBot:
 
         atr_fast = calc_atr(self.ohlc_df, ATR_FAST_PERIOD).iloc[-1]
         atr_slow = calc_atr(self.ohlc_df, ATR_SLOW_PERIOD).iloc[-1]
-        atr_fast_pips = atr_fast / self.symbol_info.pip_size
-        atr_slow_pips = atr_slow / self.symbol_info.pip_size
+        pip_size = self.symbol_info.pip_size
+        atr_fast_pips = atr_fast / pip_size
+        atr_slow_pips = atr_slow / pip_size
         exit_params = make_exit_params(atr_fast_pips, atr_slow_pips, SPREAD_PIPS)
         if not exit_params.trade_allowed:
             return
 
-        if self.open_position and entry_time >= self.open_position.timeout_time:
-            self._close_position_market()
+        # timeout handling
+        for position in list(self.open_positions):
+            if entry_time >= position.timeout_time:
+                self._close_position_market(position)
+
+        # expire regime window
+        if self.active_regime and entry_time >= self.active_regime.expires_at:
+            self.active_regime = None
+            self.trigger_engine.reset()
+            self.risk_manager.on_regime_change(None)
+
+        # evaluate regime once per completed bar
+        if self.regime_decider and (
+            self.last_regime_timestamp is None or entry_time > self.last_regime_timestamp
+        ):
+            sec_range = float(latest["high"] - latest["low"])
+            regime = self.regime_decider.evaluate(
+                self.ohlc_df,
+                timestamp=entry_time,
+                phase=1.0,
+                sec_range=sec_range,
+            )
+            self.active_regime = regime
+            self.last_regime_timestamp = entry_time
+            self.trigger_engine.on_regime_change(self.active_regime)
+            regime_id = regime.regime_id if regime else None
+            self.risk_manager.on_regime_change(regime_id)
+            if regime:
+                print(
+                    f"[REGIME] {regime.regime} p_buy={regime.p_buy:.3f} p_sell={regime.p_sell:.3f} valid_until={regime.expires_at}"
+                )
+
+        if not self.active_regime or self.active_regime.regime == "NO_TRADE":
             return
 
-        if self.open_position:
-            return
-
-        phase = 1.0
-        sec_range = float(latest["high"] - latest["low"])
-        state_vec = build_state_vec_fast(self.ohlc_df.tail(REQUIRED_CANDLES), phase, sec_range)
-        state_vec = self.scaler.transform([state_vec])[0].astype(np.float32)
-
-        with torch.no_grad():
-            t = torch.from_numpy(state_vec).unsqueeze(0).float()
-            q_long = self.models["long"](t).cpu().numpy().reshape(-1)
-            q_short = self.models["short"](t).cpu().numpy().reshape(-1)
-        p_long = float(softmax_probs(q_long)[1])
-        p_short = float(softmax_probs(q_short)[1])
-
-        decision = decide_entry_two_models(p_long, p_short, ENTRY_TH)
-        if decision == "HOLD":
+        self.trigger_engine.update_price(entry_time, float(latest["close"]))
+        signal = self.trigger_engine.check(
+            self.active_regime,
+            pip_size=pip_size,
+            now=entry_time,
+            cooldown_seconds=LOWER_TRIGGER_COOLDOWN,
+        )
+        if not signal:
             return
 
         trend_dir = compute_trend_direction(self.ohlc_df["close"], window=REQUIRED_CANDLES)
-        if decision == "LONG" and trend_dir < 0:
+        if signal.direction == "LONG" and trend_dir < 0:
             return
-        if decision == "SHORT" and trend_dir > 0:
+        if signal.direction == "SHORT" and trend_dir > 0:
+            return
+
+        risk = self.risk_manager.can_enter(
+            signal.direction,
+            current_time=entry_time,
+            open_positions=self.open_positions,
+            regime_id=self.active_regime.regime_id if self.active_regime else None,
+            spread_pips=SPREAD_PIPS,
+        )
+        if not risk.allowed:
+            print(f"[RISK] Blocked {signal.direction}: {risk.reason}")
             return
 
         position = build_exit_levels(
-            decision,
+            signal.direction,
             float(latest["close"]),
-            self.symbol_info.pip_size,
+            pip_size,
             exit_params,
             entry_time,
         )
+        position.regime_id = self.active_regime.regime_id if self.active_regime else None
         self._open_position(position, exit_params)
 
     def _open_position(self, position, exit_params: ExitParams):
@@ -370,34 +441,43 @@ class AxioryCTraderBot:
         req.takeProfit = position.tp_price
 
         self.client.send(req).addErrback(self._on_error)
-        self.pending_exit_params = exit_params
         position.volume_units = volume_units
-        self.open_position = position
+        self.open_positions.append(position)
+        self.risk_manager.register_entry(position.entry_time)
         print(
             f"[ENTRY] {position.side} price={position.entry_price:.5f} TP={position.tp_price:.5f} "
             f"SL={position.sl_price:.5f} lots={lots:.2f}"
         )
 
-    def _close_position_market(self):
-        if not self.open_position:
-            return
+    def _close_position_market(self, position: Optional[PositionState] = None):
+        if position is None:
+            if not self.open_positions:
+                return
+            position = self.open_positions[0]
         req = ProtoOAClosePositionReq()
         req.ctidTraderAccountId = int(self.account_id)
-        if hasattr(self.open_position, "position_id"):
-            req.positionId = int(self.open_position.position_id)
-        req.volume = getattr(self.open_position, "volume_units", 0)
+        if position.position_id:
+            req.positionId = int(position.position_id)
+        req.volume = getattr(position, "volume_units", 0)
         self.client.send(req).addErrback(self._on_error)
-        print("[EXIT] TIMEOUT - closing position by market")
-        self.open_position = None
+        print(f"[EXIT] Closing {position.side} by market (timeout)")
+        if position in self.open_positions:
+            self.open_positions.remove(position)
 
     def _handle_execution_event(self, message):
-        if not self.open_position:
+        if not self.open_positions:
             return
         position = message.position
-        if position and position.positionId:
-            self.open_position.position_id = position.positionId
-            if position.positionStatus == 2:  # POSITION_STATUS_CLOSED
-                self.open_position = None
+        if not position or not position.positionId:
+            return
+        for local in list(self.open_positions):
+            if local.position_id and local.position_id != position.positionId:
+                continue
+            local.position_id = position.positionId
+            if position.positionStatus == 2:  # closed
+                print(f"[EXIT] Broker closed position {position.positionId}")
+                self.open_positions.remove(local)
+            break
 
 
 if __name__ == "__main__":
