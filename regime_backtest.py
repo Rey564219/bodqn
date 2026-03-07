@@ -14,13 +14,26 @@ import torch
 from regime_executor import MeanReversionTrigger, RegimeDecider, RiskManager
 from shared_features import build_state_vec_fast
 from trade_core import ATR_FAST_PERIOD, ATR_SLOW_PERIOD, calc_atr, make_exit_params
-from train_dqn import QNet, simulate_exit
+from train_dqn import QNet, TRADE_PAIRS, simulate_exit
 
-MODEL_FILES = {
-    "long": "./Models/dqn_policy_high.pt",
-    "short": "./Models/dqn_policy_low.pt",
-}
-SCALER_FILE = "./Models/dqn_scaler.pkl"
+
+def _resolve_model_artifacts(pair: str):
+    model_pair = str(pair).upper()
+    if model_pair not in TRADE_PAIRS:
+        raise SystemExit(f"Unsupported pair '{pair}'. Choose from {TRADE_PAIRS}")
+
+    model_dir = os.path.join("Models", model_pair)
+    model_files = {
+        "long": os.path.join(model_dir, "dqn_policy_high.pt"),
+        "short": os.path.join(model_dir, "dqn_policy_low.pt"),
+    }
+    scaler_file = os.path.join(model_dir, "dqn_scaler.pkl")
+
+    missing = [p for p in [*model_files.values(), scaler_file] if not os.path.exists(p)]
+    if missing:
+        raise SystemExit(f"Model artifacts not found for {model_pair}: {missing}")
+
+    return model_files, scaler_file
 
 
 def _pip_size_for_pair(pair: str) -> float:
@@ -222,7 +235,7 @@ def summarize(trades: List[TradeResult]):
 def main():
     parser = argparse.ArgumentParser(description="Regime/Trigger backtest")
     parser.add_argument("--data", default="data/USDJPY_M1.csv")
-    parser.add_argument("--pair", default="USDJPY")
+    parser.add_argument("--pair", default="USDJPY", choices=TRADE_PAIRS)
     parser.add_argument("--th-long", type=float, default=0.55)
     parser.add_argument("--th-short", type=float, default=0.55)
     parser.add_argument("--rows", type=int, default=None, help="Limit to last N rows for quick runs")
@@ -233,13 +246,14 @@ def main():
         minute_df = minute_df.tail(args.rows)
     lower = _resample_lower(minute_df)
 
-    scaler = _load_scaler(SCALER_FILE)
+    model_files, scaler_file = _resolve_model_artifacts(args.pair)
+    scaler = _load_scaler(scaler_file)
     feature_dim = getattr(scaler, "n_features_in_", None)
     if feature_dim is None:
         raise SystemExit("Scaler missing n_features_in_")
 
-    long_model = _load_model(MODEL_FILES["long"], feature_dim)
-    short_model = _load_model(MODEL_FILES["short"], feature_dim)
+    long_model = _load_model(model_files["long"], feature_dim)
+    short_model = _load_model(model_files["short"], feature_dim)
 
     trades = run_backtest(
         minute_df,

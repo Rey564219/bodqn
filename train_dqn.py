@@ -19,6 +19,7 @@ import gc
 gc.set_threshold(700, 10, 10)  # GCをより積極的に実行
 
 import pickle, random, math
+from datetime import datetime
 from typing import Optional
 import numpy as np
 import pandas as pd
@@ -52,7 +53,8 @@ from shared_features import (
     compute_trend_direction,
 )
 
-pair = "USDJPY"
+TRADE_PAIRS = ["USDJPY", "EURUSD", "AUDJPY", "BTCUSD", "ETHUSD"]
+pair = TRADE_PAIRS[0]
 ACTIONS = 2  # 0:Hold, 1:Mode-specific action (High or Low)
 ACTION_MODES = {
     "high": {"label": "High", "id": 1, "model_name": "dqn_policy_high.pt"},
@@ -62,8 +64,10 @@ ACTION_MODES = {
 # 資産タイプ別の手数料・スリッページ（単純化したbps）
 FEE_TABLE = {
     "crypto": {"entry": 0.0006, "exit": 0.0006, "slippage": 0.0002},  # 0.12% + slippage
-    "fx": {"entry": 0.0001, "exit": 0.0001, "slippage": 0.00005},    # 0.02% + slippage（スプレッド相当）
+    "fx": {"entry": 0.0, "exit": 0.0, "slippage": 0.0},               # FXはspread_pipsで主に表現
 }
+
+TREND_PENALTY_VALUE = float(os.getenv("TREND_PENALTY_VALUE", "0.0"))
 
 # デフォルトのエグジット設定（n分後 or TP/SL）
 DEFAULT_EXIT_CONFIG = {
@@ -429,8 +433,37 @@ def build_state_batch_parallel(ohlc_data_list, extra_list=None, n_workers=None):
     return np.stack(states, axis=0).astype(np.float32)
 
 def _get_fee_rate(asset_type: str) -> float:
+    env_fee = os.getenv("FEE_RATE")
+    if env_fee:
+        try:
+            return float(env_fee)
+        except ValueError:
+            pass
+
+    if str(asset_type).lower() == "fx":
+        env_fx_fee = os.getenv("FX_FEE_RATE")
+        if env_fx_fee:
+            try:
+                return float(env_fx_fee)
+            except ValueError:
+                pass
+
+    if str(asset_type).lower() == "crypto":
+        env_crypto_fee = os.getenv("CRYPTO_FEE_RATE")
+        if env_crypto_fee:
+            try:
+                return float(env_crypto_fee)
+            except ValueError:
+                pass
+
     cfg = FEE_TABLE.get(str(asset_type).lower(), FEE_TABLE["fx"])
     return float(cfg.get("entry", 0.0) + cfg.get("exit", 0.0) + cfg.get("slippage", 0.0))
+
+
+def _exit_param_value(exit_params, key: str, default):
+    if isinstance(exit_params, dict):
+        return exit_params.get(key, default)
+    return getattr(exit_params, key, default)
 
 
 def simulate_exit(entry_action, entry_price, future_bars, exit_params, pip_size):
@@ -438,9 +471,9 @@ def simulate_exit(entry_action, entry_price, future_bars, exit_params, pip_size)
     future_bars: DataFrame with columns high/low/close
     exit_params: {tp_pips, sl_pips, max_hold_min}
     """
-    horizon = max(1, int(exit_params.get("max_hold_min", 1)))
-    tp_pips = float(exit_params.get("tp_pips", 0.0))
-    sl_pips = float(exit_params.get("sl_pips", 0.0))
+    horizon = max(1, int(_exit_param_value(exit_params, "max_hold_min", 1)))
+    tp_pips = float(_exit_param_value(exit_params, "tp_pips", 0.0))
+    sl_pips = float(_exit_param_value(exit_params, "sl_pips", 0.0))
 
     if future_bars is None or len(future_bars) == 0:
         return entry_price, "no_future"
@@ -494,7 +527,7 @@ def compute_reward(entry_action, entry_price, future_bars, trend_dir=0.0, asset_
             "max_hold_min": DEFAULT_EXIT_CONFIG["horizon_bars"],
         }
 
-    if not exit_params.get("trade_allowed", True):
+    if not bool(_exit_param_value(exit_params, "trade_allowed", True)):
         return 0.0, entry_price, "no_trade"
 
     exit_price, exit_reason = simulate_exit(entry_action, entry_price, future_bars, exit_params, pip_size)
@@ -514,9 +547,9 @@ def compute_reward(entry_action, entry_price, future_bars, trend_dir=0.0, asset_
     trend_penalty = 0.0
     trend_threshold = 1e-6
     if entry_action == 1 and trend_dir < -trend_threshold:
-        trend_penalty = 0.001
+        trend_penalty = TREND_PENALTY_VALUE
     elif entry_action == 2 and trend_dir > trend_threshold:
-        trend_penalty = 0.001
+        trend_penalty = TREND_PENALTY_VALUE
 
     reward = np.clip((net - trend_penalty) * 5000.0, -50.0, 50.0)
     return float(reward), exit_price, exit_reason
@@ -1160,6 +1193,7 @@ def evaluate_dqn_model(q, scaler, ohlc_df, n_eval=2000, device='cpu', window_siz
             future_slice = ohlc_df.iloc[i+1:i+1+exit_params["max_hold_min"]][['high', 'low', 'close']]
             if len(future_slice) == 0:
                 continue
+            next_close = float(future_slice['close'].iloc[0])
             trend_dir = compute_trend_direction(sl['close'], window=window_size)
             real_action = action_id if a == 1 else 0
             exit_price, exit_reason, bars_held = simulate_exit_stats(
@@ -1243,15 +1277,14 @@ if __name__ == "__main__":
         torch.backends.cudnn.allow_tf32 = True
         print("[INFO] CUDA TF32 acceleration enabled")
     
-    # ====== 複数通貨ペアのデータを統合 ======
+    # ====== 複数通貨ペアを個別学習 ======
     print("\n" + "="*80)
-    print("[INFO] 複数通貨ペアのデータを読み込んで統合します")
+    print("[INFO] 複数通貨ペアを個別に読み込んで学習します")
     print("="*80)
     
     # 使用する通貨ペアリスト
-    currency_pairs = ["USDJPY", "EURUSD", "AUDJPY"]
+    currency_pairs = TRADE_PAIRS
     
-    all_dfs = []
     successful_pairs = []
     
     for currency_pair in currency_pairs:
@@ -1289,29 +1322,38 @@ if __name__ == "__main__":
                                        'volume': np.float32})
                 
                 # 連番インデックスを使用してDatetimeIndexを生成
-                from datetime import datetime, timedelta
-                # 通貨ペアごとに異なる開始時刻を設定（データ重複を避ける）
-                pair_offset = len(all_dfs) * 365  # 1年ずつずらす
-                start_time = datetime(2020, 1, 1, 0, 0, 0) + timedelta(days=pair_offset)
+                from datetime import datetime
+                start_time = datetime(2020, 1, 1, 0, 0, 0)
                 df.index = pd.date_range(start=start_time, periods=len(df), freq='1min')
                 
             else:
                 print(f"[WARN] {currency_pair}: Unexpected number of columns: {num_columns}. Skipping.")
                 continue
             
-            # 価格を正規化（通貨ペア間の価格差を吸収）
-            # 各通貨ペアの平均価格で正規化
-            price_mean = df['close'].mean()
-            df['open'] = df['open'] / price_mean
-            df['high'] = df['high'] / price_mean
-            df['low'] = df['low'] / price_mean
-            df['close'] = df['close'] / price_mean
-            
-            print(f"[SUCCESS] {currency_pair}: {len(df)} rows loaded and normalized")
+            price_mean = float(df['close'].mean())
+            print(f"[SUCCESS] {currency_pair}: {len(df)} rows loaded")
             print(f"  Date range: {df.index[0]} to {df.index[-1]}")
-            print(f"  Price mean: {price_mean:.5f} (normalized to 1.0)")
-            
-            all_dfs.append(df)
+            print(f"  Price mean: {price_mean:.5f} (raw scale)")
+
+            pair_asset_type = 'crypto' if currency_pair.upper().endswith('USD') and currency_pair.upper().startswith(('BTC', 'ETH')) else 'fx'
+            pair_save_dir = os.path.join('Models', currency_pair)
+
+            print("\n" + "-"*80)
+            print(f"[INFO] {currency_pair} を個別学習します (asset_type={pair_asset_type}, save_dir={pair_save_dir})")
+            print("-"*80)
+
+            for mode in ACTION_MODES.keys():
+                print("\n" + "="*80)
+                print(f"[INFO] Training {currency_pair} {mode.upper()} model")
+                print("="*80)
+                train_dqn(
+                    df,
+                    pair=currency_pair,
+                    target_action=mode,
+                    asset_type=pair_asset_type,
+                    save_dir=pair_save_dir,
+                )
+
             successful_pairs.append(currency_pair)
             
         except FileNotFoundError:
@@ -1319,8 +1361,7 @@ if __name__ == "__main__":
         except Exception as e:
             print(f"[ERROR] {currency_pair}: Error loading data: {e}")
     
-    # データの統合
-    if not all_dfs:
+    if not successful_pairs:
         print("\n[ERROR] 利用可能なデータがありません。終了します。")
         import glob
         available_files = glob.glob("data/*_M1.csv")
@@ -1328,38 +1369,7 @@ if __name__ == "__main__":
         for file in available_files:
             print(f"  - {file}")
         sys.exit(1)
-    
+
     print("\n" + "="*80)
-    print(f"[INFO] データ統合: {len(successful_pairs)}通貨ペア ({', '.join(successful_pairs)})")
+    print(f"[INFO] 個別学習完了: {len(successful_pairs)}通貨ペア ({', '.join(successful_pairs)})")
     print("="*80)
-    
-    # すべてのデータフレームを結合
-    df = pd.concat(all_dfs, axis=0)
-    df = df.sort_index()
-    
-    print(f"[INFO] 統合後のデータ: {len(df)} rows")
-    print(f"[INFO] Date range: {df.index[0]} to {df.index[-1]}")
-    print(f"[INFO] Sample data:")
-    print(df.head())
-    
-    print("\n[INFO] 統合データの統計:")
-    print(df.describe())
-    
-    # モデル名は統合ペア名にする
-    model_pair_name = "_".join(successful_pairs) if len(successful_pairs) > 1 else successful_pairs[0]
-    
-    print(f"\n[INFO] モデル名: {model_pair_name}")
-    print("="*80 + "\n")
-    
-    # 学習開始（High/Low専用モデルをそれぞれ学習）
-    try:
-        for mode in ACTION_MODES.keys():
-            print("\n" + "="*80)
-            print(f"[INFO] Training {mode.upper()} model")
-            print("="*80)
-            train_dqn(df, pair=model_pair_name, target_action=mode)
-        print("[INFO] 高速DQNモデル2種の保存が完了しました")
-    except Exception as e:
-        print(f"[ERROR] 学習中にエラーが発生しました: {e}")
-        import traceback
-        traceback.print_exc()

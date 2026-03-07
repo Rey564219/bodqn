@@ -33,7 +33,7 @@ except Exception as e:  # pragma: no cover
         "shared_features is required for feature extraction."
     ) from e
 
-from train_dqn import QNet
+from train_dqn import QNet, TRADE_PAIRS
 
 
 BASE_URL = os.getenv("BINANCE_FAPI_BASE_URL", "https://fapi.binance.com")
@@ -49,11 +49,31 @@ SPREAD_PIPS = float(os.getenv("SPREAD_PIPS", "0.0"))
 TAKER_FEE = float(os.getenv("TAKER_FEE", "0.0004"))
 SLIPPAGE_RATE = float(os.getenv("SLIPPAGE_RATE", "0.0001"))
 
-MODEL_FILES = {
-    "long": "./Models/dqn_policy_high.pt",
-    "short": "./Models/dqn_policy_low.pt",
-}
-SCALER_FILE = "./Models/dqn_scaler.pkl"
+
+def _normalize_pair_name(symbol: str) -> str:
+    normalized = "".join(ch for ch in str(symbol).upper() if ch.isalnum())
+    if normalized.endswith("USDT"):
+        normalized = normalized[:-1]
+    return normalized
+
+
+def _resolve_model_artifacts(symbol: str):
+    model_pair = _normalize_pair_name(symbol)
+    if model_pair not in TRADE_PAIRS:
+        raise SystemExit(f"Unsupported model pair '{model_pair}' from symbol '{symbol}'. Choose from {TRADE_PAIRS}")
+
+    model_dir = os.path.join("Models", model_pair)
+    model_files = {
+        "long": os.path.join(model_dir, "dqn_policy_high.pt"),
+        "short": os.path.join(model_dir, "dqn_policy_low.pt"),
+    }
+    scaler_file = os.path.join(model_dir, "dqn_scaler.pkl")
+
+    missing = [p for p in [*model_files.values(), scaler_file] if not os.path.exists(p)]
+    if missing:
+        raise SystemExit(f"Model artifacts not found for {model_pair}: {missing}")
+
+    return model_pair, model_files, scaler_file
 
 
 class BinanceFuturesClient:
@@ -107,8 +127,11 @@ class BinanceFuturesClient:
 class BinanceFuturesBot:
     def __init__(self):
         self.client = BinanceFuturesClient(BASE_URL, API_KEY, API_SECRET)
-        self.scaler = self._load_scaler()
-        self.models = self._load_models()
+        self.model_pair, self.model_files, self.scaler_file = _resolve_model_artifacts(SYMBOL)
+        print(f"[INFO] Using model artifacts for pair: {self.model_pair}")
+
+        self.scaler = self._load_scaler(self.scaler_file)
+        self.models = self._load_models(self.model_files)
         self.symbol_info = self._load_symbol_info()
 
         self.open_position = None
@@ -117,15 +140,15 @@ class BinanceFuturesBot:
 
         self.client.set_leverage(SYMBOL, LEVERAGE)
 
-    def _load_scaler(self):
+    def _load_scaler(self, scaler_file: str):
         import pickle
 
-        with open(SCALER_FILE, "rb") as f:
+        with open(scaler_file, "rb") as f:
             return pickle.load(f)
 
-    def _load_models(self):
+    def _load_models(self, model_files: dict):
         models = {}
-        for key, path in MODEL_FILES.items():
+        for key, path in model_files.items():
             qnet = QNet(self.scaler.n_features_in_, 2)
             state = torch.load(path, map_location="cpu")
             if isinstance(state, dict) and "state_dict" in state:
