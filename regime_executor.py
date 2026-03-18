@@ -254,6 +254,7 @@ class RiskManager:
         open_positions: Iterable[Dict],
         regime_id: Optional[str],
         spread_pips: Optional[float] = None,
+        ignore_cooldown: bool = False,
     ) -> RiskCheckResult:
         self._reset_minute_if_needed(current_time)
         self.on_regime_change(regime_id)
@@ -262,7 +263,7 @@ class RiskManager:
             if spread_pips > self.max_spread_pips:
                 return RiskCheckResult(False, "spread_block")
 
-        if self.last_entry_time:
+        if self.last_entry_time and not ignore_cooldown:
             delta = (current_time - self.last_entry_time).total_seconds()
             if delta < self.entry_cooldown_seconds:
                 return RiskCheckResult(False, "cooldown")

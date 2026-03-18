@@ -5,7 +5,7 @@ import os
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -100,6 +100,10 @@ def run_backtest(
     pair: str,
     th_long: float,
     th_short: float,
+    add_on_min_adverse_pips: float = 0.25,
+    add_on_rebound_confirm_pips: float = 0.12,
+    add_on_size_ratio: float = 0.7,
+    add_on_min_extreme_updates: int = 2,
 ) -> List[TradeResult]:
     regime_decider = RegimeDecider(
         scaler=scaler,
@@ -124,9 +128,59 @@ def run_backtest(
     atr_slow = calc_atr(minute_df, ATR_SLOW_PERIOD)
 
     open_trades: List[dict] = []
+    last_primary_entry_minute: Dict[str, datetime] = {}
+    add_on_plan: Optional[dict] = None
+
+    def _execute_trade(direction: str, entry_ts: datetime, entry_price: float, size_ratio: float = 1.0):
+        minute_bar = minute_df.loc[:entry_ts].iloc[-1]
+        idx = minute_df.index.get_loc(minute_bar.name)
+        atr_f = float(atr_fast.iloc[idx])
+        atr_s = float(atr_slow.iloc[idx])
+        exit_params = make_exit_params(atr_f / pip_size, atr_s / pip_size, spread)
+        future_slice = minute_df.iloc[idx + 1 : idx + 1 + exit_params.max_hold_min]
+        exit_price, exit_reason = simulate_exit(
+            1 if direction == "LONG" else 2,
+            entry_price,
+            future_slice,
+            exit_params,
+            pip_size,
+        )
+        pnl_pips = (
+            (exit_price - entry_price) / pip_size
+            if direction == "LONG"
+            else (entry_price - exit_price) / pip_size
+        )
+        pnl_pips -= spread
+        pnl_pips *= max(0.0, float(size_ratio))
+        exit_time = (
+            future_slice.index[0]
+            if len(future_slice)
+            else entry_ts + timedelta(minutes=exit_params.max_hold_min)
+        )
+        trade_results.append(
+            TradeResult(
+                direction=direction,
+                entry_time=entry_ts,
+                exit_time=exit_time,
+                entry_price=entry_price,
+                exit_price=exit_price,
+                pnl_pips=float(pnl_pips),
+                reason=exit_reason,
+            )
+        )
+        open_trades.append({"side": direction, "entry_time": entry_ts})
+        risk.register_entry(entry_ts)
+        risk.register_exit(
+            direction=direction,
+            pnl_fraction=pnl_pips * pip_size / entry_price,
+            exit_time=exit_time,
+            regime_id=active_regime.regime_id if active_regime else None,
+        )
+        open_trades.pop()
 
     for ts, price in lower_prices.items():
         price = float(price)
+        minute_key = ts.replace(second=0, microsecond=0)
         # update regime on minute boundaries
         if next_minute and ts >= next_minute[0]:
             while next_minute and ts >= next_minute[0]:
@@ -147,7 +201,44 @@ def run_backtest(
 
         trigger.update_price(ts, price)
         if not active_regime or active_regime.regime == "NO_TRADE":
+            add_on_plan = None
             continue
+
+        if add_on_plan and add_on_plan["minute"] != minute_key:
+            add_on_plan = None
+
+        if add_on_plan and not add_on_plan["added"]:
+            direction = add_on_plan["direction"]
+            if direction == "LONG":
+                if price < add_on_plan["extreme_price"]:
+                    add_on_plan["extreme_price"] = price
+                    add_on_plan["extreme_updates"] += 1
+                adverse = (add_on_plan["entry_price"] - add_on_plan["extreme_price"]) / pip_size
+                rebound = (price - add_on_plan["extreme_price"]) / pip_size
+            else:
+                if price > add_on_plan["extreme_price"]:
+                    add_on_plan["extreme_price"] = price
+                    add_on_plan["extreme_updates"] += 1
+                adverse = (add_on_plan["extreme_price"] - add_on_plan["entry_price"]) / pip_size
+                rebound = (add_on_plan["extreme_price"] - price) / pip_size
+
+            if (
+                adverse >= add_on_min_adverse_pips
+                and rebound >= add_on_rebound_confirm_pips
+                and add_on_plan["extreme_updates"] >= add_on_min_extreme_updates
+            ):
+                risk_check = risk.can_enter(
+                    direction,
+                    current_time=ts,
+                    open_positions=open_trades,
+                    regime_id=active_regime.regime_id,
+                    spread_pips=spread,
+                    ignore_cooldown=True,
+                )
+                if risk_check.allowed:
+                    _execute_trade(direction, ts, price, size_ratio=add_on_size_ratio)
+                    add_on_plan["added"] = True
+
         signal = trigger.check(
             active_regime,
             pip_size=pip_size,
@@ -155,6 +246,9 @@ def run_backtest(
             cooldown_seconds=risk.entry_cooldown_seconds,
         )
         if not signal:
+            continue
+
+        if last_primary_entry_minute.get(signal.direction) == minute_key:
             continue
 
         risk_check = risk.can_enter(
@@ -166,43 +260,16 @@ def run_backtest(
         )
         if not risk_check.allowed:
             continue
-
-        minute_bar = minute_df.loc[:ts].iloc[-1]
-        idx = minute_df.index.get_loc(minute_bar.name)
-        atr_f = float(atr_fast.iloc[idx])
-        atr_s = float(atr_slow.iloc[idx])
-        exit_params = make_exit_params(atr_f / pip_size, atr_s / pip_size, spread)
-        future_slice = minute_df.iloc[idx + 1 : idx + 1 + exit_params.max_hold_min]
-        exit_price, exit_reason = simulate_exit(
-            1 if signal.direction == "LONG" else 2,
-            price,
-            future_slice,
-            exit_params,
-            pip_size,
-        )
-        pnl_pips = (exit_price - price) / pip_size if signal.direction == "LONG" else (price - exit_price) / pip_size
-        pnl_pips -= spread
-        exit_time = future_slice.index[0] if len(future_slice) else ts + timedelta(minutes=exit_params.max_hold_min)
-        trade_results.append(
-            TradeResult(
-                direction=signal.direction,
-                entry_time=ts,
-                exit_time=exit_time,
-                entry_price=price,
-                exit_price=exit_price,
-                pnl_pips=float(pnl_pips),
-                reason=exit_reason,
-            )
-        )
-        open_trades.append({"side": signal.direction, "entry_time": ts})
-        risk.register_entry(ts)
-        risk.register_exit(
-            direction=signal.direction,
-            pnl_fraction=pnl_pips * pip_size / price,
-            exit_time=exit_time,
-            regime_id=active_regime.regime_id,
-        )
-        open_trades.pop()
+        _execute_trade(signal.direction, ts, price)
+        last_primary_entry_minute[signal.direction] = minute_key
+        add_on_plan = {
+            "minute": minute_key,
+            "direction": signal.direction,
+            "entry_price": price,
+            "extreme_price": price,
+            "extreme_updates": 0,
+            "added": False,
+        }
 
     return trade_results
 
@@ -238,6 +305,10 @@ def main():
     parser.add_argument("--pair", default="USDJPY", choices=TRADE_PAIRS)
     parser.add_argument("--th-long", type=float, default=0.55)
     parser.add_argument("--th-short", type=float, default=0.55)
+    parser.add_argument("--add-on-min-adverse", type=float, default=0.25)
+    parser.add_argument("--add-on-rebound", type=float, default=0.12)
+    parser.add_argument("--add-on-size-ratio", type=float, default=0.7)
+    parser.add_argument("--add-on-min-extreme-updates", type=int, default=2)
     parser.add_argument("--rows", type=int, default=None, help="Limit to last N rows for quick runs")
     args = parser.parse_args()
 
@@ -264,6 +335,10 @@ def main():
         pair=args.pair,
         th_long=args.th_long,
         th_short=args.th_short,
+        add_on_min_adverse_pips=args.add_on_min_adverse,
+        add_on_rebound_confirm_pips=args.add_on_rebound,
+        add_on_size_ratio=args.add_on_size_ratio,
+        add_on_min_extreme_updates=args.add_on_min_extreme_updates,
     )
     stats = summarize(trades)
     print(f"Trades: {stats['trades']} | Wins: {stats['wins']} | Losses: {stats['losses']}")

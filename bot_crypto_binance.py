@@ -48,6 +48,10 @@ LEVERAGE = int(os.getenv("LEVERAGE", "5"))
 SPREAD_PIPS = float(os.getenv("SPREAD_PIPS", "0.0"))
 TAKER_FEE = float(os.getenv("TAKER_FEE", "0.0004"))
 SLIPPAGE_RATE = float(os.getenv("SLIPPAGE_RATE", "0.0001"))
+ADD_ON_MIN_ADVERSE_PIPS = float(os.getenv("ADD_ON_MIN_ADVERSE_PIPS", "0.25"))
+ADD_ON_REBOUND_CONFIRM_PIPS = float(os.getenv("ADD_ON_REBOUND_CONFIRM_PIPS", "0.12"))
+ADD_ON_SIZE_RATIO = float(os.getenv("ADD_ON_SIZE_RATIO", "0.7"))
+ADD_ON_MIN_EXTREME_UPDATES = int(os.getenv("ADD_ON_MIN_EXTREME_UPDATES", "2"))
 
 
 def _normalize_pair_name(symbol: str) -> str:
@@ -137,8 +141,50 @@ class BinanceFuturesBot:
         self.open_position = None
         self.tp_order_id = None
         self.sl_order_id = None
+        self.last_primary_entry_minute = {}
+        self.add_on_plan = None
 
         self.client.set_leverage(SYMBOL, LEVERAGE)
+
+    def _minute_key(self, dt: datetime) -> datetime:
+        return dt.replace(second=0, microsecond=0)
+
+    def _build_add_on_plan(self, direction: str, entry_time: datetime, entry_price: float):
+        self.add_on_plan = {
+            "minute": self._minute_key(entry_time),
+            "direction": direction,
+            "entry_price": entry_price,
+            "extreme_price": entry_price,
+            "extreme_updates": 0,
+            "added": False,
+        }
+
+    def _update_add_on_state(self, now: datetime, price: float, pip_size: float) -> bool:
+        if not self.add_on_plan or self.add_on_plan.get("added"):
+            return False
+        if self._minute_key(now) != self.add_on_plan["minute"]:
+            self.add_on_plan = None
+            return False
+
+        direction = self.add_on_plan["direction"]
+        if direction == "LONG":
+            if price < self.add_on_plan["extreme_price"]:
+                self.add_on_plan["extreme_price"] = price
+                self.add_on_plan["extreme_updates"] += 1
+            adverse = (self.add_on_plan["entry_price"] - self.add_on_plan["extreme_price"]) / pip_size
+            rebound = (price - self.add_on_plan["extreme_price"]) / pip_size
+        else:
+            if price > self.add_on_plan["extreme_price"]:
+                self.add_on_plan["extreme_price"] = price
+                self.add_on_plan["extreme_updates"] += 1
+            adverse = (self.add_on_plan["extreme_price"] - self.add_on_plan["entry_price"]) / pip_size
+            rebound = (self.add_on_plan["extreme_price"] - price) / pip_size
+
+        return (
+            adverse >= ADD_ON_MIN_ADVERSE_PIPS
+            and rebound >= ADD_ON_REBOUND_CONFIRM_PIPS
+            and self.add_on_plan["extreme_updates"] >= ADD_ON_MIN_EXTREME_UPDATES
+        )
 
     def _load_scaler(self, scaler_file: str):
         import pickle
@@ -242,17 +288,14 @@ class BinanceFuturesBot:
             self.sl_order_id = None
 
     def run(self):
-        last_bar = None
         while True:
+            time.sleep(2)
             df = self._fetch_ohlc()
             last_ts = df.index[-1]
-            if last_bar is not None and last_ts <= last_bar:
-                time.sleep(2)
-                continue
-            last_bar = last_ts
 
             latest = df.iloc[-1]
             entry_time = last_ts.to_pydatetime().replace(tzinfo=None)
+            minute_key = self._minute_key(entry_time)
 
             atr_fast = calc_atr(df, ATR_FAST_PERIOD).iloc[-1]
             atr_slow = calc_atr(df, ATR_SLOW_PERIOD).iloc[-1]
@@ -274,9 +317,29 @@ class BinanceFuturesBot:
                 )
                 print(f"[EXIT] TIMEOUT PnL~ {pnl:.4f}")
                 self.open_position = None
+                self.add_on_plan = None
                 continue
 
             if self.open_position:
+                if self._update_add_on_state(entry_time, float(latest["close"]), tick_size):
+                    add_qty = self._round_qty(self.open_position.qty * max(0.05, min(1.0, ADD_ON_SIZE_RATIO)))
+                    add_qty = self._round_qty(add_qty)
+                    if add_qty > 0:
+                        side = "BUY" if self.open_position.side == "LONG" else "SELL"
+                        add_params = {
+                            "symbol": SYMBOL,
+                            "side": side,
+                            "type": "MARKET",
+                            "quantity": add_qty,
+                        }
+                        self.client.place_order(add_params)
+                        total_qty = self.open_position.qty + add_qty
+                        self.open_position.entry_price = (
+                            (self.open_position.entry_price * self.open_position.qty) + (float(latest["close"]) * add_qty)
+                        ) / total_qty
+                        self.open_position.qty = total_qty
+                        self.add_on_plan["added"] = True
+                        print(f"[ENTRY-ADD] {self.open_position.side} rebound within minute qty={add_qty}")
                 continue
 
             phase = 1.0
@@ -296,6 +359,9 @@ class BinanceFuturesBot:
 
             decision = decide_entry_two_models(p_long, p_short, ENTRY_TH)
             if decision == "HOLD":
+                continue
+
+            if self.last_primary_entry_minute.get(decision) == minute_key:
                 continue
 
             trend_dir = compute_trend_direction(df["close"], window=REQUIRED_CANDLES)
@@ -337,6 +403,8 @@ class BinanceFuturesBot:
             self._place_tp_sl(position.side, qty, position.tp_price, position.sl_price)
             position.qty = qty
             self.open_position = position
+            self.last_primary_entry_minute[position.side] = minute_key
+            self._build_add_on_plan(position.side, entry_time, position.entry_price)
             print(
                 f"[ENTRY] {position.side} price={position.entry_price:.2f} TP={position.tp_price:.2f} "
                 f"SL={position.sl_price:.2f} qty={qty}"

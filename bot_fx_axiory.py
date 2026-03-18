@@ -17,6 +17,7 @@ from trade_core import (
     calc_atr,
     calc_fx_lots_fixed_risk,
     make_exit_params,
+    round_step,
 )
 
 try:
@@ -85,6 +86,10 @@ MEAN_REV_FAST = int(os.getenv("MEAN_REV_FAST", "8"))
 MEAN_REV_SLOW = int(os.getenv("MEAN_REV_SLOW", "34"))
 MEAN_REV_DEV_PIPS = float(os.getenv("MEAN_REV_DEV_PIPS", "0.35"))
 LOWER_TRIGGER_COOLDOWN = float(os.getenv("LOWER_TRIGGER_COOLDOWN", "5"))
+ADD_ON_MIN_ADVERSE_PIPS = float(os.getenv("ADD_ON_MIN_ADVERSE_PIPS", "0.25"))
+ADD_ON_REBOUND_CONFIRM_PIPS = float(os.getenv("ADD_ON_REBOUND_CONFIRM_PIPS", "0.12"))
+ADD_ON_SIZE_RATIO = float(os.getenv("ADD_ON_SIZE_RATIO", "0.7"))
+ADD_ON_MIN_EXTREME_UPDATES = int(os.getenv("ADD_ON_MIN_EXTREME_UPDATES", "2"))
 
 
 def _normalize_pair_name(symbol: str) -> str:
@@ -149,6 +154,8 @@ class AxioryCTraderBot:
         self.open_positions: List[PositionState] = []
         self.active_regime: Optional[RegimeDecision] = None
         self.last_regime_timestamp: Optional[datetime] = None
+        self.last_primary_entry_minute = {}
+        self.add_on_plan: Optional[dict] = None
         self.trigger_engine = MeanReversionTrigger(
             fast_window=MEAN_REV_FAST,
             slow_window=MEAN_REV_SLOW,
@@ -331,8 +338,45 @@ class AxioryCTraderBot:
         last_ts = df.index[-1]
         if self.last_bar_time is None or last_ts > self.last_bar_time:
             self.last_bar_time = last_ts
-            self._maybe_trade()
+        self._maybe_trade()
         self._request_trendbars()
+
+    def _minute_key(self, dt: datetime) -> datetime:
+        return dt.replace(second=0, microsecond=0)
+
+    def _clear_add_on(self):
+        self.add_on_plan = None
+
+    def _update_add_on_state(self, now: datetime, price: float, pip_size: float) -> Optional[str]:
+        if not self.add_on_plan:
+            return None
+        if self.add_on_plan.get("added"):
+            return None
+        if self._minute_key(now) != self.add_on_plan["minute"]:
+            self._clear_add_on()
+            return None
+
+        direction = self.add_on_plan["direction"]
+        if direction == "LONG":
+            if price < self.add_on_plan["extreme_price"]:
+                self.add_on_plan["extreme_price"] = price
+                self.add_on_plan["extreme_updates"] += 1
+            adverse = (self.add_on_plan["entry_price"] - self.add_on_plan["extreme_price"]) / pip_size
+            rebound = (price - self.add_on_plan["extreme_price"]) / pip_size
+        else:
+            if price > self.add_on_plan["extreme_price"]:
+                self.add_on_plan["extreme_price"] = price
+                self.add_on_plan["extreme_updates"] += 1
+            adverse = (self.add_on_plan["extreme_price"] - self.add_on_plan["entry_price"]) / pip_size
+            rebound = (self.add_on_plan["extreme_price"] - price) / pip_size
+
+        if (
+            adverse >= ADD_ON_MIN_ADVERSE_PIPS
+            and rebound >= ADD_ON_REBOUND_CONFIRM_PIPS
+            and self.add_on_plan["extreme_updates"] >= ADD_ON_MIN_EXTREME_UPDATES
+        ):
+            return direction
+        return None
 
     def _trendbars_to_df(self, trendbars, digits: int) -> pd.DataFrame:
         scale = 10 ** digits
@@ -356,6 +400,8 @@ class AxioryCTraderBot:
 
         entry_time = self.ohlc_df.index[-1].to_pydatetime().replace(tzinfo=None)
         latest = self.ohlc_df.iloc[-1]
+        close_price = float(latest["close"])
+        minute_key = self._minute_key(entry_time)
 
         atr_fast = calc_atr(self.ohlc_df, ATR_FAST_PERIOD).iloc[-1]
         atr_slow = calc_atr(self.ohlc_df, ATR_SLOW_PERIOD).iloc[-1]
@@ -376,6 +422,7 @@ class AxioryCTraderBot:
             self.active_regime = None
             self.trigger_engine.reset()
             self.risk_manager.on_regime_change(None)
+            self._clear_add_on()
 
         # evaluate regime once per completed bar
         if self.regime_decider and (
@@ -399,9 +446,33 @@ class AxioryCTraderBot:
                 )
 
         if not self.active_regime or self.active_regime.regime == "NO_TRADE":
+            self._clear_add_on()
             return
 
-        self.trigger_engine.update_price(entry_time, float(latest["close"]))
+        add_on_direction = self._update_add_on_state(entry_time, close_price, pip_size)
+        if add_on_direction:
+            add_on_risk = self.risk_manager.can_enter(
+                add_on_direction,
+                current_time=entry_time,
+                open_positions=self.open_positions,
+                regime_id=self.active_regime.regime_id if self.active_regime else None,
+                spread_pips=SPREAD_PIPS,
+                ignore_cooldown=True,
+            )
+            if add_on_risk.allowed:
+                add_position = build_exit_levels(
+                    add_on_direction,
+                    close_price,
+                    pip_size,
+                    exit_params,
+                    entry_time,
+                )
+                add_position.regime_id = self.active_regime.regime_id if self.active_regime else None
+                self._open_position(add_position, exit_params, lot_scale=ADD_ON_SIZE_RATIO)
+                self.add_on_plan["added"] = True
+                print(f"[ENTRY-ADD] {add_on_direction} rebound within minute @ {close_price:.5f}")
+
+        self.trigger_engine.update_price(entry_time, close_price)
         signal = self.trigger_engine.check(
             self.active_regime,
             pip_size=pip_size,
@@ -409,6 +480,9 @@ class AxioryCTraderBot:
             cooldown_seconds=LOWER_TRIGGER_COOLDOWN,
         )
         if not signal:
+            return
+
+        if self.last_primary_entry_minute.get(signal.direction) == minute_key:
             return
 
         trend_dir = compute_trend_direction(self.ohlc_df["close"], window=REQUIRED_CANDLES)
@@ -430,25 +504,38 @@ class AxioryCTraderBot:
 
         position = build_exit_levels(
             signal.direction,
-            float(latest["close"]),
+            close_price,
             pip_size,
             exit_params,
             entry_time,
         )
         position.regime_id = self.active_regime.regime_id if self.active_regime else None
         self._open_position(position, exit_params)
+        self.last_primary_entry_minute[signal.direction] = minute_key
+        self.add_on_plan = {
+            "minute": minute_key,
+            "direction": signal.direction,
+            "entry_price": close_price,
+            "extreme_price": close_price,
+            "extreme_updates": 0,
+            "added": False,
+        }
 
-    def _open_position(self, position, exit_params: ExitParams):
+    def _open_position(self, position, exit_params: ExitParams, lot_scale: float = 1.0):
         if not self.symbol_info:
             return
+        min_lot = max(0.01, self.symbol_info.min_volume / 100.0)
+        lot_step = max(0.01, self.symbol_info.step_volume / 100.0)
         lots = calc_fx_lots_fixed_risk(
             balance=self.balance,
             risk_pct=RISK_PCT,
             sl_pips=exit_params.sl_pips,
             pip_value_per_lot=self.symbol_info.pip_value_per_lot,
-            min_lot=max(0.01, self.symbol_info.min_volume / 100.0),
-            lot_step=max(0.01, self.symbol_info.step_volume / 100.0),
+            min_lot=min_lot,
+            lot_step=lot_step,
         )
+        scale = max(0.05, min(1.0, float(lot_scale)))
+        lots = max(min_lot, round_step(lots * scale, lot_step))
         volume_units = int(round(lots * 100))
         if volume_units <= 0:
             return
