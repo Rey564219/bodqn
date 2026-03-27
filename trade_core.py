@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Optional, Tuple
+import os
 
 import numpy as np
 import pandas as pd
@@ -14,9 +15,10 @@ VOL_LOW_TH = 0.8
 VOL_HIGH_TH = 1.3
 MIN_TP_PIPS = 1.5
 MIN_SL_PIPS = 2.0
-N0_HOLD_MIN = 4
-N_MIN_HOLD = 2
-N_MAX_HOLD = 6
+N0_HOLD_MIN = 10
+N_MIN_HOLD = 10
+N_MAX_HOLD = 10
+TP_SL_WIDE_MULT = float(os.getenv("TP_SL_WIDE_MULT", "12.0"))
 
 
 @dataclass
@@ -101,11 +103,9 @@ def make_exit_params(
 
     tp_pips_raw = k_tp * atr_fast_pips
     sl_pips_raw = k_sl * atr_fast_pips
-    tp_pips = max(tp_pips_raw, spread_pips * 2.5, min_tp_pips)
-    sl_pips = max(sl_pips_raw, spread_pips * 3.0, min_sl_pips)
-
-    n_raw = round(n0 / r) if r > 0 else n_max
-    n = int(min(max(n_raw, n_min), n_max))
+    tp_pips = max(tp_pips_raw, spread_pips * 2.5, min_tp_pips) * max(1.0, TP_SL_WIDE_MULT)
+    sl_pips = max(sl_pips_raw, spread_pips * 3.0, min_sl_pips) * max(1.0, TP_SL_WIDE_MULT)
+    n = int(n_max)
     return ExitParams(
         trade_allowed=trade_allowed,
         regime=regime,

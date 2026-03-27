@@ -71,7 +71,7 @@ TREND_PENALTY_VALUE = float(os.getenv("TREND_PENALTY_VALUE", "0.0"))
 
 # デフォルトのエグジット設定（n分後 or TP/SL）
 DEFAULT_EXIT_CONFIG = {
-    "horizon_bars": 5,   # n分後（1分足想定）
+    "horizon_bars": 10,   # n分後（1分足想定）
 }
 
 ATR_FAST_PERIOD = 14
@@ -80,9 +80,10 @@ VOL_LOW_TH = 0.8
 VOL_HIGH_TH = 1.3
 MIN_TP_PIPS = 1.5
 MIN_SL_PIPS = 2.0
-N0_HOLD_MIN = 4
-N_MIN_HOLD = 2
-N_MAX_HOLD = 6
+N0_HOLD_MIN = 10
+N_MIN_HOLD = 10
+N_MAX_HOLD = 10
+TP_SL_WIDE_MULT = float(os.getenv("TP_SL_WIDE_MULT", "12.0"))
 
 def _pip_size_for_pair(pair_name: str, price: Optional[float] = None) -> float:
     env_pip = os.getenv("PIP_SIZE")
@@ -161,11 +162,9 @@ def make_exit_params(
 
     tp_pips_raw = k_tp * atr_fast_pips
     sl_pips_raw = k_sl * atr_fast_pips
-    tp_pips = max(tp_pips_raw, spread_pips * 2.5, min_tp_pips)
-    sl_pips = max(sl_pips_raw, spread_pips * 3.0, min_sl_pips)
-
-    n_raw = round(n0 / r) if r > 0 else n_max
-    n = int(min(max(n_raw, n_min), n_max))
+    tp_pips = max(tp_pips_raw, spread_pips * 2.5, min_tp_pips) * max(1.0, TP_SL_WIDE_MULT)
+    sl_pips = max(sl_pips_raw, spread_pips * 3.0, min_sl_pips) * max(1.0, TP_SL_WIDE_MULT)
+    n = int(n_max)
     return {
         "trade_allowed": trade_allowed,
         "regime": regime,

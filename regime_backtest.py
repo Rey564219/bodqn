@@ -14,7 +14,7 @@ import torch
 from regime_executor import MeanReversionTrigger, RegimeDecider, RiskManager
 from shared_features import build_state_vec_fast
 from trade_core import ATR_FAST_PERIOD, ATR_SLOW_PERIOD, calc_atr, make_exit_params
-from train_dqn import QNet, TRADE_PAIRS, simulate_exit
+from train_dqn import QNet, TRADE_PAIRS, simulate_exit_stats
 
 
 def _resolve_model_artifacts(pair: str):
@@ -138,7 +138,7 @@ def run_backtest(
         atr_s = float(atr_slow.iloc[idx])
         exit_params = make_exit_params(atr_f / pip_size, atr_s / pip_size, spread)
         future_slice = minute_df.iloc[idx + 1 : idx + 1 + exit_params.max_hold_min]
-        exit_price, exit_reason = simulate_exit(
+        exit_price, exit_reason, bars_held = simulate_exit_stats(
             1 if direction == "LONG" else 2,
             entry_price,
             future_slice,
@@ -152,11 +152,7 @@ def run_backtest(
         )
         pnl_pips -= spread
         pnl_pips *= max(0.0, float(size_ratio))
-        exit_time = (
-            future_slice.index[0]
-            if len(future_slice)
-            else entry_ts + timedelta(minutes=exit_params.max_hold_min)
-        )
+        exit_time = entry_ts + timedelta(minutes=max(1, int(bars_held)))
         trade_results.append(
             TradeResult(
                 direction=direction,
