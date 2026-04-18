@@ -14,6 +14,7 @@ from trade_core import (
     ATR_SLOW_PERIOD,
     ExitParams,
     build_exit_levels,
+    calibrate_tp_k,
     calc_atr,
     calc_fx_lots_fixed_risk,
     make_exit_params,
@@ -408,7 +409,17 @@ class AxioryCTraderBot:
         pip_size = self.symbol_info.pip_size
         atr_fast_pips = atr_fast / pip_size
         atr_slow_pips = atr_slow / pip_size
-        exit_params = make_exit_params(atr_fast_pips, atr_slow_pips, SPREAD_PIPS)
+        tp_k = calibrate_tp_k(
+            self.ohlc_df,
+            pip_size=pip_size,
+            horizon_min=10,
+        )
+        exit_params = make_exit_params(
+            atr_fast_pips,
+            atr_slow_pips,
+            SPREAD_PIPS,
+            tp_k=tp_k,
+        )
         if not exit_params.trade_allowed:
             return
 

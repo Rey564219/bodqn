@@ -18,6 +18,7 @@ from trade_core import (
     ATR_FAST_PERIOD,
     ATR_SLOW_PERIOD,
     build_exit_levels,
+    calibrate_tp_k,
     calc_atr,
     calc_crypto_qty_fixed_risk,
     decide_entry_two_models,
@@ -302,7 +303,17 @@ class BinanceFuturesBot:
             tick_size, _ = self.symbol_info
             atr_fast_pips = atr_fast / tick_size
             atr_slow_pips = atr_slow / tick_size
-            exit_params = make_exit_params(atr_fast_pips, atr_slow_pips, SPREAD_PIPS)
+            tp_k = calibrate_tp_k(
+                df,
+                pip_size=tick_size,
+                horizon_min=10,
+            )
+            exit_params = make_exit_params(
+                atr_fast_pips,
+                atr_slow_pips,
+                SPREAD_PIPS,
+                tp_k=tp_k,
+            )
 
             if self.open_position and entry_time >= self.open_position.timeout_time:
                 self._cancel_exit_orders()

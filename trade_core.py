@@ -18,7 +18,13 @@ MIN_SL_PIPS = 2.0
 N0_HOLD_MIN = 10
 N_MIN_HOLD = 10
 N_MAX_HOLD = 10
-TP_SL_WIDE_MULT = float(os.getenv("TP_SL_WIDE_MULT", "12.0"))
+TP_SL_WIDE_MULT = float(os.getenv("TP_SL_WIDE_MULT", "1.0"))
+TP_TARGET_PROB = float(os.getenv("TP_TARGET_PROB", "0.45"))
+TP_K_FALLBACK = float(os.getenv("TP_K_FALLBACK", "1.5"))
+TP_K_MIN = float(os.getenv("TP_K_MIN", "0.5"))
+TP_K_MAX = float(os.getenv("TP_K_MAX", "3.0"))
+SL_K_MULT = float(os.getenv("SL_K_MULT", "1.2"))
+TP_CALIBRATION_MIN_SAMPLES = int(os.getenv("TP_CALIBRATION_MIN_SAMPLES", "200"))
 
 
 @dataclass
@@ -71,10 +77,65 @@ def get_vol_regime(atr_fast: float, atr_slow: float) -> str:
     return "HIGH"
 
 
+def calibrate_tp_k(
+    ohlc_df: pd.DataFrame,
+    pip_size: float,
+    horizon_min: int = N_MAX_HOLD,
+    atr_period: int = ATR_FAST_PERIOD,
+    target_prob: float = TP_TARGET_PROB,
+    min_samples: int = TP_CALIBRATION_MIN_SAMPLES,
+    k_min: float = TP_K_MIN,
+    k_max: float = TP_K_MAX,
+    fallback_k: float = TP_K_FALLBACK,
+) -> float:
+    if ohlc_df is None or len(ohlc_df) <= max(atr_period, horizon_min):
+        return float(fallback_k)
+    if pip_size <= 0:
+        return float(fallback_k)
+
+    required = ["high", "low", "close"]
+    if any(col not in ohlc_df.columns for col in required):
+        return float(fallback_k)
+
+    target_prob = float(np.clip(target_prob, 0.30, 0.60))
+    atr = calc_atr(ohlc_df, atr_period)
+    ratios = []
+    last_index = len(ohlc_df) - int(max(1, horizon_min))
+
+    for i in range(max(atr_period, 1), last_index):
+        atr_val = float(atr.iloc[i])
+        if not np.isfinite(atr_val) or atr_val <= 0:
+            continue
+
+        entry = float(ohlc_df["close"].iloc[i])
+        future = ohlc_df.iloc[i + 1 : i + 1 + int(horizon_min)]
+        if len(future) == 0:
+            continue
+
+        max_up = float(future["high"].max() - entry)
+        max_down = float(entry - future["low"].min())
+        max_move_pips = max(max_up, max_down) / pip_size
+        atr_pips = atr_val / pip_size
+        if not np.isfinite(max_move_pips) or not np.isfinite(atr_pips) or atr_pips <= 0:
+            continue
+        ratios.append(max_move_pips / atr_pips)
+
+    if len(ratios) < int(max(30, min_samples)):
+        return float(fallback_k)
+
+    q = float(np.clip(1.0 - target_prob, 0.01, 0.99))
+    k = float(np.quantile(np.asarray(ratios, dtype=float), q))
+    if not np.isfinite(k):
+        return float(fallback_k)
+    return float(np.clip(k, k_min, k_max))
+
+
 def make_exit_params(
     atr_fast_pips: float,
     atr_slow_pips: float,
     spread_pips: float,
+    tp_k: Optional[float] = None,
+    sl_k: Optional[float] = None,
     min_tp_pips: float = MIN_TP_PIPS,
     min_sl_pips: float = MIN_SL_PIPS,
     n0: int = N0_HOLD_MIN,
@@ -94,12 +155,11 @@ def make_exit_params(
     regime = get_vol_regime(atr_fast_pips, atr_slow_pips)
     trade_allowed = atr_fast_pips >= spread_pips * 5.0
 
-    if regime == "LOW":
-        k_tp, k_sl = 0.6, 0.8
-    elif regime == "MID":
-        k_tp, k_sl = 0.8, 1.0
+    k_tp = float(tp_k) if tp_k is not None and np.isfinite(tp_k) and tp_k > 0 else float(TP_K_FALLBACK)
+    if sl_k is not None and np.isfinite(sl_k) and sl_k > 0:
+        k_sl = float(sl_k)
     else:
-        k_tp, k_sl = 1.0, 1.2
+        k_sl = max(k_tp * float(SL_K_MULT), k_tp)
 
     tp_pips_raw = k_tp * atr_fast_pips
     sl_pips_raw = k_sl * atr_fast_pips

@@ -44,6 +44,7 @@ from collections import deque
 from sklearn.preprocessing import StandardScaler
 import torch.nn.functional as F
 from concurrent.futures import ThreadPoolExecutor
+from trade_core import calibrate_tp_k
 
 from shared_features import (
     FeatureExtraction,
@@ -83,7 +84,9 @@ MIN_SL_PIPS = 2.0
 N0_HOLD_MIN = 10
 N_MIN_HOLD = 10
 N_MAX_HOLD = 10
-TP_SL_WIDE_MULT = float(os.getenv("TP_SL_WIDE_MULT", "12.0"))
+TP_SL_WIDE_MULT = float(os.getenv("TP_SL_WIDE_MULT", "1.0"))
+TP_K_FALLBACK = float(os.getenv("TP_K_FALLBACK", "1.5"))
+SL_K_MULT = float(os.getenv("SL_K_MULT", "1.2"))
 
 def _pip_size_for_pair(pair_name: str, price: Optional[float] = None) -> float:
     env_pip = os.getenv("PIP_SIZE")
@@ -134,6 +137,8 @@ def make_exit_params(
     atr_fast_pips: float,
     atr_slow_pips: float,
     spread_pips: float,
+    tp_k: Optional[float] = None,
+    sl_k: Optional[float] = None,
     min_tp_pips: float = MIN_TP_PIPS,
     min_sl_pips: float = MIN_SL_PIPS,
     n0: int = N0_HOLD_MIN,
@@ -153,12 +158,11 @@ def make_exit_params(
     regime = get_vol_regime(atr_fast_pips, atr_slow_pips)
     trade_allowed = atr_fast_pips >= spread_pips * 5.0
 
-    if regime == "LOW":
-        k_tp, k_sl = 0.6, 0.8
-    elif regime == "MID":
-        k_tp, k_sl = 0.8, 1.0
+    k_tp = float(tp_k) if tp_k is not None and np.isfinite(tp_k) and tp_k > 0 else float(TP_K_FALLBACK)
+    if sl_k is not None and np.isfinite(sl_k) and sl_k > 0:
+        k_sl = float(sl_k)
     else:
-        k_tp, k_sl = 1.0, 1.2
+        k_sl = max(k_tp * float(SL_K_MULT), k_tp)
 
     tp_pips_raw = k_tp * atr_fast_pips
     sl_pips_raw = k_sl * atr_fast_pips
@@ -649,6 +653,12 @@ def train_dqn(ohlc_df, pair=pair, save_dir="./Models",
     ohlc_df = ohlc_df[['open','high','low','close']].copy()
     atr_fast_series = calc_atr(ohlc_df, ATR_FAST_PERIOD)
     atr_slow_series = calc_atr(ohlc_df, ATR_SLOW_PERIOD)
+    calibrated_tp_k = calibrate_tp_k(
+        ohlc_df,
+        pip_size=pip_size,
+        horizon_min=10,
+    )
+    print(f"[INFO] Calibrated TP k (10min reach target 30-60%): {calibrated_tp_k:.4f}")
     
     # 全データを使用（上限なし）
     print(f"[INFO] Using all {len(ohlc_df)} rows for training")
@@ -926,7 +936,12 @@ def train_dqn(ohlc_df, pair=pair, save_dir="./Models",
                 entry_price = float(ohlc_df['close'].iloc[i])
                 atr_fast_pips = float(atr_fast_series.iloc[i]) / pip_size
                 atr_slow_pips = float(atr_slow_series.iloc[i]) / pip_size
-                exit_params = make_exit_params(atr_fast_pips, atr_slow_pips, spread_pips)
+                exit_params = make_exit_params(
+                    atr_fast_pips,
+                    atr_slow_pips,
+                    spread_pips,
+                    tp_k=calibrated_tp_k,
+                )
                 future_slice = ohlc_df.iloc[i+1:i+1+exit_params["max_hold_min"]][['high', 'low', 'close']]
                 if len(future_slice) == 0:
                     continue  # 未来データ不足
@@ -1123,6 +1138,11 @@ def evaluate_dqn_model(q, scaler, ohlc_df, n_eval=2000, device='cpu', window_siz
     spread_pips = _default_spread_pips(pair)
     atr_fast_series = calc_atr(ohlc_df, ATR_FAST_PERIOD)
     atr_slow_series = calc_atr(ohlc_df, ATR_SLOW_PERIOD)
+    calibrated_tp_k = calibrate_tp_k(
+        ohlc_df,
+        pip_size=pip_size,
+        horizon_min=10,
+    )
 
     # 全体の統計
     correct, total = 0, 0
@@ -1188,7 +1208,12 @@ def evaluate_dqn_model(q, scaler, ohlc_df, n_eval=2000, device='cpu', window_siz
             entry_price = float(sl['close'].iloc[-1])
             atr_fast_pips = float(atr_fast_series.iloc[i]) / pip_size
             atr_slow_pips = float(atr_slow_series.iloc[i]) / pip_size
-            exit_params = make_exit_params(atr_fast_pips, atr_slow_pips, spread_pips)
+            exit_params = make_exit_params(
+                atr_fast_pips,
+                atr_slow_pips,
+                spread_pips,
+                tp_k=calibrated_tp_k,
+            )
             future_slice = ohlc_df.iloc[i+1:i+1+exit_params["max_hold_min"]][['high', 'low', 'close']]
             if len(future_slice) == 0:
                 continue

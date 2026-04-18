@@ -13,7 +13,7 @@ import torch
 
 from regime_executor import MeanReversionTrigger, RegimeDecider, RiskManager
 from shared_features import build_state_vec_fast
-from trade_core import ATR_FAST_PERIOD, ATR_SLOW_PERIOD, calc_atr, make_exit_params
+from trade_core import ATR_FAST_PERIOD, ATR_SLOW_PERIOD, calibrate_tp_k, calc_atr, make_exit_params
 from train_dqn import QNet, TRADE_PAIRS, simulate_exit_stats
 
 
@@ -126,6 +126,7 @@ def run_backtest(
 
     atr_fast = calc_atr(minute_df, ATR_FAST_PERIOD)
     atr_slow = calc_atr(minute_df, ATR_SLOW_PERIOD)
+    tp_k = calibrate_tp_k(minute_df, pip_size=pip_size, horizon_min=10)
 
     open_trades: List[dict] = []
     last_primary_entry_minute: Dict[str, datetime] = {}
@@ -136,7 +137,12 @@ def run_backtest(
         idx = minute_df.index.get_loc(minute_bar.name)
         atr_f = float(atr_fast.iloc[idx])
         atr_s = float(atr_slow.iloc[idx])
-        exit_params = make_exit_params(atr_f / pip_size, atr_s / pip_size, spread)
+        exit_params = make_exit_params(
+            atr_f / pip_size,
+            atr_s / pip_size,
+            spread,
+            tp_k=tp_k,
+        )
         future_slice = minute_df.iloc[idx + 1 : idx + 1 + exit_params.max_hold_min]
         exit_price, exit_reason, bars_held = simulate_exit_stats(
             1 if direction == "LONG" else 2,
