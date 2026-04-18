@@ -8,7 +8,7 @@ ROWS ?=
 TH_LONG ?= 0.55
 TH_SHORT ?= 0.55
 
-.PHONY: help train backtest live-fx live-crypto smoke
+.PHONY: help train backtest live-fx live-fx-check live-crypto live-crypto-check smoke
 
 help:
 	@Write-Host "Available targets:" -ForegroundColor Cyan
@@ -17,7 +17,9 @@ help:
 	@Write-Host "  make backtest PAIR=EURUSD      # 通貨ペアを変更" 
 	@Write-Host "  make backtest DATA=data/EURUSD_M1.csv ROWS=20000 TH_LONG=0.56 TH_SHORT=0.55"
 	@Write-Host "  make live-fx                   # cTrader(Axiory) bot を起動（環境変数必須）"
-	@Write-Host "  make live-crypto               # MEXC futures bot を起動（環境変数必須）"
+	@Write-Host "  make live-fx-check             # cTrader事前確認（初期化のみ、注文なし）"
+	@Write-Host "  make live-crypto               # Bitget futures bot を起動（環境変数必須）"
+	@Write-Host "  make live-crypto-check         # Bitget接続確認（残高取得のみ、注文なし）"
 	@Write-Host "  make smoke                     # 構文チェック"
 
 train:
@@ -29,8 +31,14 @@ backtest:
 live-fx:
 	$(PY) bot_fx_axiory.py
 
+live-fx-check:
+	$(PY) -c "from bot_fx_axiory import AxioryCTraderBot, CTRADER_CLIENT_ID, CTRADER_CLIENT_SECRET, CTRADER_ACCESS_TOKEN, CTRADER_ACCOUNT_ID, CTRADER_SYMBOL; assert CTRADER_CLIENT_ID and CTRADER_CLIENT_SECRET and CTRADER_ACCESS_TOKEN and CTRADER_ACCOUNT_ID, 'Set CTRADER_CLIENT_ID, CTRADER_CLIENT_SECRET, CTRADER_ACCESS_TOKEN, CTRADER_ACCOUNT_ID'; b=AxioryCTraderBot(); print('[OK] cTrader preflight initialized'); print('[SYMBOL]:', CTRADER_SYMBOL); print('[ACCOUNT_ID]:', CTRADER_ACCOUNT_ID); print('[MODEL_PAIR]:', b.model_pair)"
+
 live-crypto:
-	$(PY) bot_crypto_binance.py
+	$(PY) bot_crypto_bitget.py
+
+live-crypto-check:
+	$(PY) -c "from bot_crypto_bitget import BitgetFuturesClient, BASE_URL, API_KEY, API_SECRET, API_PASSPHRASE; assert API_KEY and API_SECRET and API_PASSPHRASE, 'Set BITGET_API_KEY, BITGET_API_SECRET and BITGET_API_PASSPHRASE'; c=BitgetFuturesClient(BASE_URL, API_KEY, API_SECRET, API_PASSPHRASE); data=c.get_balance(); print('[OK] Bitget account rows:', len(data)); usdt=next((x for x in data if str(x.get('marginCoin','')).upper()=='USDT'), None); print('[USDT available]:', usdt.get('available') if usdt else 'not found')"
 
 smoke:
-	$(PY) -m py_compile train_dqn.py regime_backtest.py regime_executor.py trade_core.py shared_features.py bot_fx_axiory.py bot_crypto_binance.py
+	$(PY) -m py_compile train_dqn.py regime_backtest.py regime_executor.py trade_core.py shared_features.py bot_fx_axiory.py bot_crypto_bitget.py

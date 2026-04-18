@@ -5,6 +5,7 @@ import hmac
 import json
 import os
 import time
+import base64
 from datetime import datetime, timezone
 from typing import Optional, Tuple
 from urllib.parse import urlencode
@@ -37,26 +38,26 @@ except Exception as e:  # pragma: no cover
 from train_dqn import QNet, TRADE_PAIRS
 
 
-BASE_URL = os.getenv("MEXC_FUTURES_BASE_URL", "https://api.mexc.com")
-API_KEY = os.getenv("MEXC_API_KEY", os.getenv("BINANCE_API_KEY", ""))
-API_SECRET = os.getenv("MEXC_API_SECRET", os.getenv("BINANCE_API_SECRET", ""))
+BASE_URL = os.getenv("BITGET_FUTURES_BASE_URL", "https://api.bitget.com")
+API_KEY = os.getenv("BITGET_API_KEY", os.getenv("MEXC_API_KEY", os.getenv("BINANCE_API_KEY", "")))
+API_SECRET = os.getenv("BITGET_API_SECRET", os.getenv("MEXC_API_SECRET", os.getenv("BINANCE_API_SECRET", "")))
+API_PASSPHRASE = os.getenv("BITGET_API_PASSPHRASE", "")
 
-def _to_mexc_symbol(raw_symbol: str) -> str:
+def _to_bitget_symbol(raw_symbol: str) -> str:
     s = str(raw_symbol or "").upper().strip()
     if "_" in s:
-        return s
-    if s.endswith("USDT") and len(s) > 4:
-        return f"{s[:-4]}_USDT"
+        return s.replace("_", "")
     return s
 
 
-SYMBOL = _to_mexc_symbol(os.getenv("MEXC_SYMBOL", os.getenv("BINANCE_SYMBOL", "BTC_USDT")))
+SYMBOL = _to_bitget_symbol(os.getenv("BITGET_SYMBOL", os.getenv("MEXC_SYMBOL", os.getenv("BINANCE_SYMBOL", "BTCUSDT"))))
+BITGET_PRODUCT_TYPE = os.getenv("BITGET_PRODUCT_TYPE", "USDT-FUTURES").upper()
+BITGET_MARGIN_MODE = os.getenv("BITGET_MARGIN_MODE", "crossed").lower()  # isolated or crossed
+BITGET_MARGIN_COIN = os.getenv("BITGET_MARGIN_COIN", "USDT").upper()
 ENTRY_TH = float(os.getenv("ENTRY_TH", "0.55"))
 REQUIRED_CANDLES = int(os.getenv("REQUIRED_CANDLES", "75"))
 RISK_PCT = float(os.getenv("RISK_PCT", "0.005"))
 LEVERAGE = int(os.getenv("LEVERAGE", "5"))
-MEXC_OPEN_TYPE = int(os.getenv("MEXC_OPEN_TYPE", "2"))  # 1: isolated, 2: cross
-MEXC_POSITION_MODE = int(os.getenv("MEXC_POSITION_MODE", "2"))  # 1: hedged, 2: one-way
 SPREAD_PIPS = float(os.getenv("SPREAD_PIPS", "0.0"))
 TAKER_FEE = float(os.getenv("TAKER_FEE", "0.0004"))
 SLIPPAGE_RATE = float(os.getenv("SLIPPAGE_RATE", "0.0001"))
@@ -92,98 +93,114 @@ def _resolve_model_artifacts(symbol: str):
     return model_pair, model_files, scaler_file
 
 
-class MexcFuturesClient:
-    def __init__(self, base_url: str, api_key: str, api_secret: str):
+class BitgetFuturesClient:
+    def __init__(self, base_url: str, api_key: str, api_secret: str, passphrase: str):
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
-        self.api_secret = api_secret.encode("utf-8")
+        self.api_secret = (api_secret or "").encode("utf-8")
+        self.passphrase = passphrase or ""
 
-    def _sign(self, timestamp_ms: str, method: str, params: Optional[dict], body: Optional[dict]) -> str:
-        if method in ("GET", "DELETE"):
-            sign_params = {k: v for k, v in (params or {}).items() if v is not None}
-            param_str = urlencode(sorted(sign_params.items()), doseq=True)
-        else:
-            if isinstance(body, list):
-                clean_body = body
-            else:
-                clean_body = {k: v for k, v in (body or {}).items() if v is not None}
-            param_str = json.dumps(clean_body, separators=(",", ":"), ensure_ascii=False)
-        target = f"{self.api_key}{timestamp_ms}{param_str}"
-        return hmac.new(self.api_secret, target.encode("utf-8"), hashlib.sha256).hexdigest()
+    def _sign(self, timestamp_ms: str, method: str, request_path: str, query_str: str, body_str: str) -> str:
+        payload = f"{timestamp_ms}{method.upper()}{request_path}"
+        if query_str:
+            payload += f"?{query_str}"
+        payload += body_str
+        digest = hmac.new(self.api_secret, payload.encode("utf-8"), hashlib.sha256).digest()
+        return base64.b64encode(digest).decode("utf-8")
 
     def _request(self, method: str, path: str, params: Optional[dict] = None, body: Optional[dict] = None, signed: bool = False):
         params = params or {}
-        url = f"{self.base_url}{path}"
-        query = urlencode(params, doseq=True)
+        query_params = {k: v for k, v in params.items() if v is not None}
+        query = urlencode(sorted(query_params.items()), doseq=True)
+        request_path = path
+        url = f"{self.base_url}{request_path}"
         if query:
             url = f"{url}?{query}"
         headers = {}
         payload = None
+        body_str = ""
         if method == "POST":
             if isinstance(body, list):
                 clean_body = body
             else:
                 clean_body = {k: v for k, v in (body or {}).items() if v is not None}
-            payload = json.dumps(clean_body, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+            body_str = json.dumps(clean_body, separators=(",", ":"), ensure_ascii=False)
+            payload = body_str.encode("utf-8")
             headers["Content-Type"] = "application/json"
 
         if signed:
             timestamp_ms = str(int(time.time() * 1000))
-            headers["ApiKey"] = self.api_key
-            headers["Request-Time"] = timestamp_ms
-            headers["Signature"] = self._sign(timestamp_ms, method, params, body)
-            headers["Recv-Window"] = "10000"
+            headers["ACCESS-KEY"] = self.api_key
+            headers["ACCESS-PASSPHRASE"] = self.passphrase
+            headers["ACCESS-TIMESTAMP"] = timestamp_ms
+            headers["ACCESS-SIGN"] = self._sign(timestamp_ms, method, request_path, query, body_str)
+            headers["locale"] = "en-US"
 
         req = Request(url, method=method, headers=headers, data=payload)
         with urlopen(req, timeout=10) as resp:
             raw = json.loads(resp.read().decode("utf-8"))
 
-        if isinstance(raw, dict) and "success" in raw:
-            if not raw.get("success"):
-                raise RuntimeError(f"MEXC API error code={raw.get('code')} message={raw.get('message')}")
+        if isinstance(raw, dict) and "code" in raw:
+            if str(raw.get("code")) != "00000":
+                raise RuntimeError(f"Bitget API error code={raw.get('code')} message={raw.get('msg')}")
             return raw.get("data")
         return raw
 
     def get_exchange_info(self):
-        return self._request("GET", "/api/v1/contract/detail", params={"symbol": SYMBOL})
-
-    def get_klines(self, symbol: str, interval: str, limit: int):
-        end_ts = int(time.time())
-        start_ts = max(0, end_ts - int(max(1, limit) * 60))
         return self._request(
             "GET",
-            f"/api/v1/contract/kline/{symbol}",
-            params={"interval": interval, "start": start_ts, "end": end_ts},
+            "/api/v2/mix/market/contracts",
+            params={"productType": BITGET_PRODUCT_TYPE, "symbol": SYMBOL},
+        )
+
+    def get_klines(self, symbol: str, interval: str, limit: int):
+        end_ts = int(time.time() * 1000)
+        start_ts = max(0, end_ts - int(max(1, limit) * 60 * 1000))
+        return self._request(
+            "GET",
+            "/api/v2/mix/market/candles",
+            params={
+                "symbol": symbol,
+                "productType": BITGET_PRODUCT_TYPE,
+                "granularity": interval,
+                "startTime": str(start_ts),
+                "endTime": str(end_ts),
+                "limit": str(min(max(50, limit), 1000)),
+            },
         )
 
     def get_balance(self):
-        return self._request("GET", "/api/v1/private/account/assets", signed=True)
+        return self._request("GET", "/api/v2/mix/account/accounts", params={"productType": BITGET_PRODUCT_TYPE}, signed=True)
 
     def set_leverage(self, symbol: str, leverage: int):
-        # MEXC keeps leverage per side; apply both for compatibility.
-        self._request(
-            "POST",
-            "/api/v1/private/position/change_leverage",
-            body={"symbol": symbol, "leverage": int(leverage), "openType": MEXC_OPEN_TYPE, "positionType": 1},
-            signed=True,
-        )
         return self._request(
             "POST",
-            "/api/v1/private/position/change_leverage",
-            body={"symbol": symbol, "leverage": int(leverage), "openType": MEXC_OPEN_TYPE, "positionType": 2},
+            "/api/v2/mix/account/set-leverage",
+            body={
+                "symbol": symbol,
+                "productType": BITGET_PRODUCT_TYPE,
+                "marginCoin": BITGET_MARGIN_COIN,
+                "marginMode": BITGET_MARGIN_MODE,
+                "leverage": str(int(leverage)),
+            },
             signed=True,
         )
 
     def place_order(self, params: dict):
-        return self._request("POST", "/api/v1/private/order/create", body=params, signed=True)
+        return self._request("POST", "/api/v2/mix/order/place-order", body=params, signed=True)
 
     def cancel_order(self, symbol: str, order_id: int):
-        return self._request("POST", "/api/v1/private/order/cancel", body=[int(order_id)], signed=True)
+        return self._request(
+            "POST",
+            "/api/v2/mix/order/cancel-order",
+            body={"symbol": symbol, "productType": BITGET_PRODUCT_TYPE, "orderId": str(order_id)},
+            signed=True,
+        )
 
 
-class MexcFuturesBot:
+class BitgetFuturesBot:
     def __init__(self):
-        self.client = MexcFuturesClient(BASE_URL, API_KEY, API_SECRET)
+        self.client = BitgetFuturesClient(BASE_URL, API_KEY, API_SECRET, API_PASSPHRASE)
         self.model_pair, self.model_files, self.scaler_file = _resolve_model_artifacts(SYMBOL)
         print(f"[INFO] Using model artifacts for pair: {self.model_pair}")
 
@@ -264,45 +281,43 @@ class MexcFuturesBot:
         if isinstance(info, list):
             for sym in info:
                 if sym.get("symbol") == SYMBOL:
-                    tick = float(sym.get("priceUnit", 0.0) or 0.0)
-                    step = float(sym.get("volUnit", 1.0) or 1.0)
-                    min_vol = float(sym.get("minVol", 1.0) or 1.0)
-                    contract_size = float(sym.get("contractSize", 1.0) or 1.0)
+                    price_place = int(float(sym.get("pricePlace", "1") or 1))
+                    tick = float(10 ** (-price_place))
+                    step = float(sym.get("sizeMultiplier", sym.get("minTradeNum", "0.001")) or 0.001)
+                    min_vol = float(sym.get("minTradeNum", step) or step)
+                    contract_size = 1.0
                     return tick, step, min_vol, contract_size
         elif isinstance(info, dict) and info.get("symbol") == SYMBOL:
-            tick = float(info.get("priceUnit", 0.0) or 0.0)
-            step = float(info.get("volUnit", 1.0) or 1.0)
-            min_vol = float(info.get("minVol", 1.0) or 1.0)
-            contract_size = float(info.get("contractSize", 1.0) or 1.0)
+            price_place = int(float(info.get("pricePlace", "1") or 1))
+            tick = float(10 ** (-price_place))
+            step = float(info.get("sizeMultiplier", info.get("minTradeNum", "0.001")) or 0.001)
+            min_vol = float(info.get("minTradeNum", step) or step)
+            contract_size = 1.0
             return tick, step, min_vol, contract_size
-        raise RuntimeError(f"Symbol not found in MEXC contract detail: {SYMBOL}")
+        raise RuntimeError(f"Symbol not found in Bitget contract detail: {SYMBOL}")
 
     def _get_balance(self) -> float:
         data = self.client.get_balance()
         for row in data:
-            if row.get("asset") == "USDT":
-                return float(row.get("availableBalance", 0.0))
-            if row.get("currency") == "USDT":
-                return float(row.get("availableBalance", 0.0))
+            if str(row.get("marginCoin", "")).upper() == BITGET_MARGIN_COIN:
+                return float(row.get("available", 0.0))
         return 0.0
 
     def _fetch_ohlc(self) -> pd.DataFrame:
-        raw = self.client.get_klines(SYMBOL, "Min1", REQUIRED_CANDLES)
-        times = raw.get("time", [])
-        opens = raw.get("open", [])
-        highs = raw.get("high", [])
-        lows = raw.get("low", [])
-        closes = raw.get("close", [])
-        vols = raw.get("vol", [])
+        raw = self.client.get_klines(SYMBOL, "1m", REQUIRED_CANDLES)
         rows = []
-        for ts_s, o, h, l, c, v in zip(times, opens, highs, lows, closes, vols):
-            ts = datetime.fromtimestamp(float(ts_s), tz=timezone.utc)
-            rows.append((ts, float(o), float(h), float(l), float(c), float(v)))
+        for item in raw:
+            if len(item) < 6:
+                continue
+            ts = datetime.fromtimestamp(float(item[0]) / 1000.0, tz=timezone.utc)
+            rows.append((ts, float(item[1]), float(item[2]), float(item[3]), float(item[4]), float(item[5])))
         df = pd.DataFrame(rows, columns=["ts", "open", "high", "low", "close", "volume"])
-        return df.set_index("ts")
+        if df.empty:
+            return df
+        return df.sort_values("ts").set_index("ts")
 
     def _place_tp_sl(self, side: str, qty: float, tp_price: float, sl_price: float):
-        # TP/SL is attached to the entry order on MEXC; keep this as a no-op for compatibility.
+        # Bitget supports preset TP/SL in place-order payload; keep this no-op for compatibility.
         return
 
     def _round_qty(self, qty: float) -> float:
@@ -319,30 +334,23 @@ class MexcFuturesBot:
         return float(np.round(price / tick) * tick)
 
     def _qty_base_to_contracts(self, qty_base: float) -> float:
-        _, vol_step, min_vol, contract_size = self.symbol_info
-        if contract_size <= 0:
-            return self._round_qty(qty_base)
-        contracts = qty_base / contract_size
-        contracts = self._round_qty(contracts)
-        return max(contracts, min_vol)
+        return self._round_qty(qty_base)
 
     def _contracts_to_qty_base(self, contracts: float) -> float:
-        contract_size = self.symbol_info[3]
-        return float(contracts) * float(contract_size)
+        return float(contracts)
 
     def _close_market(self, side: str, qty: float):
-        # MEXC side mapping: 2=close short, 4=close long
-        close_side = 4 if side == "LONG" else 2
-        vol = self._qty_base_to_contracts(qty)
+        close_side = "sell" if side == "LONG" else "buy"
+        size = self._qty_base_to_contracts(qty)
         params = {
             "symbol": SYMBOL,
+            "productType": BITGET_PRODUCT_TYPE,
+            "marginMode": BITGET_MARGIN_MODE,
+            "marginCoin": BITGET_MARGIN_COIN,
             "side": close_side,
-            "type": 5,
-            "openType": MEXC_OPEN_TYPE,
-            "positionMode": MEXC_POSITION_MODE,
-            "vol": vol,
-            "price": self._round_price(self.last_price) if self.last_price > 0 else None,
-            "reduceOnly": True,
+            "orderType": "market",
+            "size": f"{size}",
+            "reduceOnly": "YES",
         }
         self.client.place_order(params)
 
@@ -353,6 +361,8 @@ class MexcFuturesBot:
         while True:
             time.sleep(2)
             df = self._fetch_ohlc()
+            if df is None or df.empty:
+                continue
             last_ts = df.index[-1]
 
             latest = df.iloc[-1]
@@ -398,19 +408,18 @@ class MexcFuturesBot:
                     add_qty = self._round_qty(self.open_position.qty * max(0.05, min(1.0, ADD_ON_SIZE_RATIO)))
                     add_qty = self._round_qty(add_qty)
                     if add_qty > 0:
-                        side = 1 if self.open_position.side == "LONG" else 3
+                        side = "buy" if self.open_position.side == "LONG" else "sell"
                         add_contracts = self._qty_base_to_contracts(add_qty)
                         if add_contracts <= 0:
                             continue
                         add_params = {
                             "symbol": SYMBOL,
+                            "productType": BITGET_PRODUCT_TYPE,
+                            "marginMode": BITGET_MARGIN_MODE,
+                            "marginCoin": BITGET_MARGIN_COIN,
                             "side": side,
-                            "type": 5,
-                            "openType": MEXC_OPEN_TYPE,
-                            "positionMode": MEXC_POSITION_MODE,
-                            "vol": add_contracts,
-                            "price": self._round_price(self.last_price) if self.last_price > 0 else None,
-                            "leverage": LEVERAGE,
+                            "orderType": "market",
+                            "size": f"{add_contracts}",
                         }
                         self.client.place_order(add_params)
                         add_qty_base = self._contracts_to_qty_base(add_contracts)
@@ -474,20 +483,18 @@ class MexcFuturesBot:
             if qty <= 0:
                 continue
 
-            side = 1 if position.side == "LONG" else 3
+            side = "buy" if position.side == "LONG" else "sell"
             entry_params = {
                 "symbol": SYMBOL,
+                "productType": BITGET_PRODUCT_TYPE,
+                "marginMode": BITGET_MARGIN_MODE,
+                "marginCoin": BITGET_MARGIN_COIN,
                 "side": side,
-                "type": 5,
-                "openType": MEXC_OPEN_TYPE,
-                "positionMode": MEXC_POSITION_MODE,
-                "vol": contracts,
-                "price": self._round_price(position.entry_price),
-                "leverage": LEVERAGE,
-                "takeProfitPrice": self._round_price(position.tp_price),
-                "stopLossPrice": self._round_price(position.sl_price),
-                "profitTrend": 1,
-                "lossTrend": 1,
+                "orderType": "market",
+                "size": f"{contracts}",
+                "reduceOnly": "NO",
+                "presetStopSurplusPrice": f"{self._round_price(position.tp_price)}",
+                "presetStopLossPrice": f"{self._round_price(position.sl_price)}",
             }
             self.client.place_order(entry_params)
             self._place_tp_sl(position.side, qty, position.tp_price, position.sl_price)
@@ -502,7 +509,7 @@ class MexcFuturesBot:
 
 
 if __name__ == "__main__":
-    if not API_KEY or not API_SECRET:
-        raise SystemExit("Set MEXC_API_KEY and MEXC_API_SECRET.")
-    bot = MexcFuturesBot()
+    if not API_KEY or not API_SECRET or not API_PASSPHRASE:
+        raise SystemExit("Set BITGET_API_KEY, BITGET_API_SECRET and BITGET_API_PASSPHRASE.")
+    bot = BitgetFuturesBot()
     bot.run()
