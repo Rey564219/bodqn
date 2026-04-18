@@ -2,16 +2,18 @@ SHELL := powershell.exe
 .SHELLFLAGS := -NoProfile -Command
 
 PY ?= python
+VENV_DIR ?= .venv
 PAIR ?= USDJPY
 DATA ?= data/$(PAIR)_M1.csv
 ROWS ?=
 TH_LONG ?= 0.55
 TH_SHORT ?= 0.55
 
-.PHONY: help train backtest live-fx live-fx-check live-crypto live-crypto-check smoke clean
+.PHONY: help venv train backtest live-fx live-fx-check live-crypto live-crypto-check smoke clean
 
 help:
 	@Write-Host "Available targets:" -ForegroundColor Cyan
+	@Write-Host "  make venv                      # .venv を作成してpip更新"
 	@Write-Host "  make train                     # train_dqn.py を実行" 
 	@Write-Host "  make backtest                  # regime_backtest.py を実行" 
 	@Write-Host "  make backtest PAIR=EURUSD      # 通貨ペアを変更" 
@@ -22,6 +24,11 @@ help:
 	@Write-Host "  make live-crypto-check         # Bitget接続確認（残高取得のみ、注文なし）"
 	@Write-Host "  make smoke                     # 構文チェック"
 	@Write-Host "  make clean                     # Pythonキャッシュを削除"
+
+venv:
+	@if (!(Test-Path "$(VENV_DIR)/Scripts/python.exe")) { $(PY) -m venv $(VENV_DIR) }
+	@$(VENV_DIR)/Scripts/python.exe -m pip install --upgrade pip
+	@Write-Host "[OK] venv ready: $(VENV_DIR)"
 
 train:
 	$(PY) train_dqn.py
@@ -47,3 +54,4 @@ smoke:
 clean:
 	@Get-ChildItem -Path . -Recurse -Directory -Filter __pycache__ | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
 	@Get-ChildItem -Path . -Recurse -File -Include *.pyc,*.pyo | Remove-Item -Force -ErrorAction SilentlyContinue
+	@if (Test-Path "$(VENV_DIR)") { Remove-Item "$(VENV_DIR)" -Recurse -Force -ErrorAction SilentlyContinue }
