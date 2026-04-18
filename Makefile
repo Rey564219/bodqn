@@ -8,7 +8,7 @@ ROWS ?=
 TH_LONG ?= 0.55
 TH_SHORT ?= 0.55
 
-.PHONY: help train backtest live-fx live-fx-check live-crypto live-crypto-check smoke
+.PHONY: help train backtest live-fx live-fx-check live-crypto live-crypto-check smoke clean
 
 help:
 	@Write-Host "Available targets:" -ForegroundColor Cyan
@@ -21,6 +21,7 @@ help:
 	@Write-Host "  make live-crypto               # Bitget futures bot を起動（環境変数必須）"
 	@Write-Host "  make live-crypto-check         # Bitget接続確認（残高取得のみ、注文なし）"
 	@Write-Host "  make smoke                     # 構文チェック"
+	@Write-Host "  make clean                     # Pythonキャッシュを削除"
 
 train:
 	$(PY) train_dqn.py
@@ -42,3 +43,7 @@ live-crypto-check:
 
 smoke:
 	$(PY) -m py_compile train_dqn.py regime_backtest.py regime_executor.py trade_core.py shared_features.py bot_fx_axiory.py bot_crypto_bitget.py
+
+clean:
+	@Get-ChildItem -Path . -Recurse -Directory -Filter __pycache__ | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+	@Get-ChildItem -Path . -Recurse -File -Include *.pyc,*.pyo | Remove-Item -Force -ErrorAction SilentlyContinue
