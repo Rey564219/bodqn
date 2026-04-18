@@ -3,7 +3,6 @@
 # Environment variables and secrets
 .env
 .env.*
-!.env.example
 
 # Python cache and bytecode
 __pycache__/
