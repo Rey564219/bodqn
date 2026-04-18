@@ -105,23 +105,6 @@ should_block_low = (
 [RESULT] 負け記録追加: High @ 150.123
 ```
 
-## 🔧 カスタマイズ
-
-### ブロック時間を変更
-```python
-ENTRY_BLOCK_DURATION_SECONDS = 180  # 3分 → 好みの秒数に変更
-```
-
-### 連敗閾値を変更
-```python
-CONSECUTIVE_LOSS_THRESHOLD = 3  # 3回 → 好みの回数に変更
-```
-
-### 負け履歴の参照期間を変更
-```python
-LOSS_LOOKBACK_MINUTES = 5  # 5分 → 好みの分数に変更
-```
-
 ## ⚠️ 注意事項
 
 1. **自動スクレイピング**: サイトの構造が変わった場合、`scrape_trade_results()` 関数を調整する必要があります。
