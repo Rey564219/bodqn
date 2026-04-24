@@ -97,7 +97,9 @@ class RegimeDecider:
         p_long = self._predict_prob(self.long_model, state_vec)
         p_short = self._predict_prob(self.short_model, state_vec)
 
-        if p_long >= self.th_buy and p_long >= p_short:
+        if p_long >= self.th_buy and p_short >= self.th_sell:
+            regime = "NO_TRADE"
+        elif p_long >= self.th_buy and p_long > p_short:
             regime = "LONG_ONLY"
         elif p_short >= self.th_sell and p_short > p_long:
             regime = "SHORT_ONLY"

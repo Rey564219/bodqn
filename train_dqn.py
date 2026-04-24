@@ -18,9 +18,12 @@ os.environ['TORCH_COMPILE_DISABLE'] = '1'
 import gc
 gc.set_threshold(700, 10, 10)  # GCをより積極的に実行
 
+import argparse
 import pickle, random, math
+import re
 from datetime import datetime
-from typing import Optional
+from pathlib import Path
+from typing import List, Optional, Tuple
 import numpy as np
 import pandas as pd
 
@@ -108,6 +111,120 @@ def _default_spread_pips(pair_name: str) -> float:
             pass
     return 0.2 if pair_name and "JPY" in pair_name.upper() else 0.8
 
+
+def _timeframe_to_minutes(timeframe: str) -> int:
+    m = re.match(r"^M(\d+)$", str(timeframe).upper())
+    if not m:
+        return 1
+    return max(1, int(m.group(1)))
+
+
+def _extract_pair_timeframe(file_path: Path) -> Optional[Tuple[str, str]]:
+    m = re.match(r"^([A-Za-z0-9]+)_([Mm]\d+)$", file_path.stem)
+    if not m:
+        return None
+    pair_name = m.group(1).upper()
+    timeframe = m.group(2).upper()
+    return pair_name, timeframe
+
+
+def _infer_asset_type(pair_name: str) -> str:
+    p = str(pair_name).upper()
+    if p.startswith(("BTC", "ETH")) and p.endswith("USD"):
+        return "crypto"
+    return "fx"
+
+
+def _build_model_save_dir(pair_name: str, timeframe: str) -> str:
+    # M1は既存の保存先を維持してライブ実行との互換性を保つ
+    if str(timeframe).upper() == "M1":
+        return os.path.join("Models", pair_name)
+    return os.path.join("Models", f"{pair_name}_{str(timeframe).upper()}")
+
+
+def _load_ohlc_csv(file_path: Path, timeframe: str) -> pd.DataFrame:
+    # 区切り文字が混在するため regex 区切りで統一読み込み
+    raw = pd.read_csv(file_path, header=None, sep=r"[,\t ]+", engine="python")
+    raw = raw.dropna(axis=1, how="all")
+    if raw.empty:
+        raise ValueError("empty file")
+
+    # 先頭行がヘッダの場合（<DATE> など）を除去
+    header_tokens = [
+        str(v).strip().lower().replace("<", "").replace(">", "")
+        for v in raw.iloc[0].tolist()
+    ]
+    if "date" in header_tokens and "time" in header_tokens and "open" in header_tokens:
+        raw = raw.iloc[1:].reset_index(drop=True)
+
+    if raw.shape[1] < 5:
+        raise ValueError(f"unexpected column count: {raw.shape[1]}")
+
+    freq_minutes = _timeframe_to_minutes(timeframe)
+
+    if raw.shape[1] >= 7:
+        # date,time,open,high,low,close,volume(またはtickvol)を想定
+        dt = pd.to_datetime(
+            raw.iloc[:, 0].astype(str).str.strip() + " " + raw.iloc[:, 1].astype(str).str.strip(),
+            errors="coerce",
+        )
+        df = pd.DataFrame(
+            {
+                "open": pd.to_numeric(raw.iloc[:, 2], errors="coerce"),
+                "high": pd.to_numeric(raw.iloc[:, 3], errors="coerce"),
+                "low": pd.to_numeric(raw.iloc[:, 4], errors="coerce"),
+                "close": pd.to_numeric(raw.iloc[:, 5], errors="coerce"),
+                "volume": pd.to_numeric(raw.iloc[:, 6], errors="coerce").fillna(0.0),
+            }
+        )
+    else:
+        # open,high,low,close,volume のみ
+        dt = pd.Series([pd.NaT] * len(raw))
+        df = pd.DataFrame(
+            {
+                "open": pd.to_numeric(raw.iloc[:, 0], errors="coerce"),
+                "high": pd.to_numeric(raw.iloc[:, 1], errors="coerce"),
+                "low": pd.to_numeric(raw.iloc[:, 2], errors="coerce"),
+                "close": pd.to_numeric(raw.iloc[:, 3], errors="coerce"),
+                "volume": pd.to_numeric(raw.iloc[:, 4], errors="coerce").fillna(0.0),
+            }
+        )
+
+    df = df.replace([np.inf, -np.inf], np.nan).dropna(subset=["open", "high", "low", "close"]).copy()
+    if df.empty:
+        raise ValueError("no valid OHLC rows")
+
+    valid_dt = dt.notna().sum()
+    if valid_dt >= max(10, int(len(df) * 0.8)):
+        df = df.iloc[: len(dt)].copy()
+        df.index = pd.DatetimeIndex(dt)
+        df = df[~df.index.isna()]
+        df = df[~df.index.duplicated(keep="last")].sort_index()
+    else:
+        start = datetime(2020, 1, 1, 0, 0, 0)
+        df.index = pd.date_range(start=start, periods=len(df), freq=f"{freq_minutes}min")
+
+    return df
+
+
+def _discover_datasets(data_dir: Path, timeframes: List[str], allowed_pairs: Optional[List[str]] = None) -> List[Tuple[str, str, Path]]:
+    tf_set = {tf.upper() for tf in timeframes}
+    pair_set = {p.upper() for p in allowed_pairs} if allowed_pairs else None
+    datasets: List[Tuple[str, str, Path]] = []
+
+    for csv_file in sorted(data_dir.glob("*.csv")):
+        extracted = _extract_pair_timeframe(csv_file)
+        if extracted is None:
+            continue
+        pair_name, timeframe = extracted
+        if timeframe not in tf_set:
+            continue
+        if pair_set is not None and pair_name not in pair_set:
+            continue
+        datasets.append((pair_name, timeframe, csv_file))
+
+    return datasets
+
 def calc_atr(df: pd.DataFrame, period: int) -> pd.Series:
     high = df["high"].astype(float)
     low = df["low"].astype(float)
@@ -179,6 +296,9 @@ def make_exit_params(
     }
 
 def decide_entry_two_models(p_long: float, p_short: float, entry_th: float) -> str:
+    # High/Low同時シグナルは優位性が薄いため見送り
+    if p_long >= entry_th and p_short >= entry_th:
+        return "HOLD"
     if p_long >= entry_th and p_long > p_short:
         return "LONG"
     if p_short >= entry_th and p_short > p_long:
@@ -1290,110 +1410,99 @@ def evaluate_dqn_model(q, scaler, ohlc_df, n_eval=2000, device='cpu', window_siz
     return acc, profit, max_dd
 
 if __name__ == "__main__":
-    # 最終的な高速化設定
     import sys
-    
+
+    parser = argparse.ArgumentParser(description="Train DQN models for all detected pair/timeframe datasets")
+    parser.add_argument("--data-dir", default=os.getenv("DATA_DIR", "data"), help="Directory containing *_M*.csv files")
+    parser.add_argument(
+        "--timeframes",
+        default=os.getenv("TRAIN_TIMEFRAMES", "M1"),
+        help="Comma-separated timeframes, e.g. M1 or M1,M5,M15",
+    )
+    parser.add_argument(
+        "--pairs",
+        default=os.getenv("TRAIN_PAIRS", ""),
+        help="Optional comma-separated pair filter, e.g. BTCUSD,ETHUSD",
+    )
+    args = parser.parse_args()
+
     print("[INFO] 高速化設定を適用中...")
-    
-    # PyTorchの高速化設定
     if torch.cuda.is_available():
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
         print("[INFO] CUDA TF32 acceleration enabled")
-    
-    # ====== 複数通貨ペアを個別学習 ======
-    print("\n" + "="*80)
-    print("[INFO] 複数通貨ペアを個別に読み込んで学習します")
-    print("="*80)
-    
-    # 使用する通貨ペアリスト
-    currency_pairs = TRADE_PAIRS
-    
-    successful_pairs = []
-    
-    for currency_pair in currency_pairs:
-        data_file = f"data/{currency_pair}_M1.csv"
-        
+
+    data_dir = Path(args.data_dir)
+    if not data_dir.exists():
+        raise SystemExit(f"Data directory not found: {data_dir}")
+
+    timeframe_list = [tf.strip().upper() for tf in str(args.timeframes).split(",") if tf.strip()]
+    if not timeframe_list:
+        timeframe_list = ["M1"]
+
+    pair_filter = [p.strip().upper() for p in str(args.pairs).split(",") if p.strip()]
+    datasets = _discover_datasets(data_dir, timeframe_list, pair_filter if pair_filter else None)
+
+    print("\n" + "=" * 80)
+    print(f"[INFO] Detecting datasets from {data_dir} for timeframes: {', '.join(timeframe_list)}")
+    if pair_filter:
+        print(f"[INFO] Pair filter: {', '.join(pair_filter)}")
+    print(f"[INFO] Detected datasets: {len(datasets)}")
+    print("=" * 80)
+
+    if not datasets:
+        print("\n[ERROR] 条件に一致する学習データがありません。")
+        print("[INFO] 利用可能なCSVファイル:")
+        for csv_file in sorted(data_dir.glob("*.csv")):
+            print(f"  - {csv_file}")
+        sys.exit(1)
+
+    successful_jobs: List[str] = []
+
+    for pair_name, timeframe, csv_path in datasets:
+        job_id = f"{pair_name}_{timeframe}"
         try:
-            print(f"\n[INFO] Loading {currency_pair} from {data_file}...")
-            
-            # まずデータを読み込んでカラム数を確認
-            df_test = pd.read_csv(data_file, nrows=5)
-            num_columns = len(df_test.columns)
-            
-            # カラム数に応じて処理を分岐
-            if num_columns >= 7:
-                # 日時カラムあり（date, time, open, high, low, close, volume）
-                column_names = ['date', 'time', 'open', 'high', 'low', 'close', 'volume']
-                df = pd.read_csv(data_file, names=column_names,
-                                dtype={'open': np.float32, 'high': np.float32, 
-                                       'low': np.float32, 'close': np.float32,
-                                       'volume': np.float32})
-                
-                # 日付と時刻を結合してDatetimeIndexを作成
-                df['datetime'] = pd.to_datetime(df['date'] + ' ' + df['time'], format='%Y.%m.%d %H:%M')
-                df = df.set_index('datetime')
-                
-                # 不要な列を削除
-                df = df[['open', 'high', 'low', 'close', 'volume']]
-                
-            elif num_columns >= 5:
-                # 日時カラムなし（open, high, low, close, volume）
-                column_names = ['open', 'high', 'low', 'close', 'volume']
-                df = pd.read_csv(data_file, names=column_names,
-                                dtype={'open': np.float32, 'high': np.float32, 
-                                       'low': np.float32, 'close': np.float32,
-                                       'volume': np.float32})
-                
-                # 連番インデックスを使用してDatetimeIndexを生成
-                from datetime import datetime
-                start_time = datetime(2020, 1, 1, 0, 0, 0)
-                df.index = pd.date_range(start=start_time, periods=len(df), freq='1min')
-                
-            else:
-                print(f"[WARN] {currency_pair}: Unexpected number of columns: {num_columns}. Skipping.")
+            print("\n" + "-" * 80)
+            print(f"[INFO] Loading {job_id} from {csv_path}")
+            print("-" * 80)
+
+            df = _load_ohlc_csv(csv_path, timeframe)
+            if len(df) < 300:
+                print(f"[WARN] {job_id}: too few rows ({len(df)}). Skipping.")
                 continue
-            
-            price_mean = float(df['close'].mean())
-            print(f"[SUCCESS] {currency_pair}: {len(df)} rows loaded")
+
+            price_mean = float(df["close"].mean())
+            print(f"[SUCCESS] {job_id}: {len(df)} rows loaded")
             print(f"  Date range: {df.index[0]} to {df.index[-1]}")
             print(f"  Price mean: {price_mean:.5f} (raw scale)")
 
-            pair_asset_type = 'crypto' if currency_pair.upper().endswith('USD') and currency_pair.upper().startswith(('BTC', 'ETH')) else 'fx'
-            pair_save_dir = os.path.join('Models', currency_pair)
+            pair_asset_type = _infer_asset_type(pair_name)
+            pair_save_dir = _build_model_save_dir(pair_name, timeframe)
 
-            print("\n" + "-"*80)
-            print(f"[INFO] {currency_pair} を個別学習します (asset_type={pair_asset_type}, save_dir={pair_save_dir})")
-            print("-"*80)
+            print(f"[INFO] Training target={job_id}, asset_type={pair_asset_type}, save_dir={pair_save_dir}")
 
             for mode in ACTION_MODES.keys():
-                print("\n" + "="*80)
-                print(f"[INFO] Training {currency_pair} {mode.upper()} model")
-                print("="*80)
+                print("\n" + "=" * 80)
+                print(f"[INFO] Training {job_id} {mode.upper()} model")
+                print("=" * 80)
                 train_dqn(
                     df,
-                    pair=currency_pair,
+                    pair=pair_name,
                     target_action=mode,
                     asset_type=pair_asset_type,
                     save_dir=pair_save_dir,
                 )
 
-            successful_pairs.append(currency_pair)
-            
-        except FileNotFoundError:
-            print(f"[WARN] {currency_pair}: File not found: {data_file}")
+            successful_jobs.append(job_id)
+
         except Exception as e:
-            print(f"[ERROR] {currency_pair}: Error loading data: {e}")
-    
-    if not successful_pairs:
-        print("\n[ERROR] 利用可能なデータがありません。終了します。")
-        import glob
-        available_files = glob.glob("data/*_M1.csv")
-        print("[INFO] 利用可能なファイル:")
-        for file in available_files:
-            print(f"  - {file}")
+            print(f"[ERROR] {job_id}: {e}")
+
+    if not successful_jobs:
+        print("\n[ERROR] 学習に成功したデータセットがありません。終了します。")
         sys.exit(1)
 
-    print("\n" + "="*80)
-    print(f"[INFO] 個別学習完了: {len(successful_pairs)}通貨ペア ({', '.join(successful_pairs)})")
-    print("="*80)
+    print("\n" + "=" * 80)
+    print(f"[INFO] 個別学習完了: {len(successful_jobs)} dataset(s)")
+    print(f"[INFO] Success list: {', '.join(successful_jobs)}")
+    print("=" * 80)

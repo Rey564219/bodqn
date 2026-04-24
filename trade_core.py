@@ -177,6 +177,9 @@ def make_exit_params(
 
 
 def decide_entry_two_models(p_long: float, p_short: float, entry_th: float) -> str:
+    # If both sides are above threshold at the same time, skip the trade.
+    if p_long >= entry_th and p_short >= entry_th:
+        return "HOLD"
     if p_long >= entry_th and p_long > p_short:
         return "LONG"
     if p_short >= entry_th and p_short > p_long:
