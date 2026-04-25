@@ -225,6 +225,116 @@ def _discover_datasets(data_dir: Path, timeframes: List[str], allowed_pairs: Opt
 
     return datasets
 
+
+def _split_time_series(
+    df: pd.DataFrame,
+    train_ratio: float = 0.70,
+    val_ratio: float = 0.15,
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    n = len(df)
+    if n < 30:
+        raise ValueError(f"not enough rows for split: {n}")
+
+    train_end = int(n * train_ratio)
+    val_end = int(n * (train_ratio + val_ratio))
+
+    # 最低限のサイズを保証
+    train_end = min(max(10, train_end), n - 2)
+    val_end = min(max(train_end + 1, val_end), n - 1)
+
+    train_df = df.iloc[:train_end].copy()
+    val_df = df.iloc[train_end:val_end].copy()
+    test_df = df.iloc[val_end:].copy()
+
+    if len(val_df) == 0 or len(test_df) == 0:
+        raise ValueError(
+            f"invalid split sizes train={len(train_df)} val={len(val_df)} test={len(test_df)}"
+        )
+
+    return train_df, val_df, test_df
+
+
+def _generate_walk_forward_splits(
+    df: pd.DataFrame,
+    mode: str,
+    train_ratio: float = 0.70,
+    val_ratio: float = 0.15,
+    test_ratio: float = 0.15,
+) -> List[Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]]:
+    mode_key = str(mode).lower()
+    if mode_key not in {"rolling", "expanding"}:
+        raise ValueError(f"unsupported walk-forward mode: {mode}")
+
+    n = len(df)
+    if n < 60:
+        return []
+
+    ratio_sum = max(1e-9, float(train_ratio + val_ratio + test_ratio))
+
+    # 単純比率が全期間をちょうど埋める場合はfoldが1つしかできないため、
+    # ウォークフォワード用にウィンドウ長を自動短縮して複数foldを作る。
+    if ratio_sum >= 0.999 and n >= 120:
+        total_window = int(n * 0.70)
+    else:
+        total_window = int(n * min(0.95, ratio_sum))
+
+    total_window = max(40, min(total_window, n - 1))
+
+    train_share = float(train_ratio) / ratio_sum
+    val_share = float(val_ratio) / ratio_sum
+    test_share = float(test_ratio) / ratio_sum
+
+    train_len = max(20, int(total_window * train_share))
+    val_len = max(10, int(total_window * val_share))
+    test_len = max(10, int(total_window * test_share))
+
+    # 合計がウィンドウ長を超えた分は test を優先して調整
+    while train_len + val_len + test_len > total_window and train_len > 20:
+        train_len -= 1
+    while train_len + val_len + test_len > total_window and val_len > 10:
+        val_len -= 1
+    while train_len + val_len + test_len > total_window and test_len > 10:
+        test_len -= 1
+
+    step = test_len
+
+    splits: List[Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]] = []
+
+    if mode_key == "rolling":
+        start = 0
+        while True:
+            train_start = start
+            train_end = train_start + train_len
+            val_end = train_end + val_len
+            test_end = val_end + test_len
+            if test_end > n:
+                break
+            splits.append(
+                (
+                    df.iloc[train_start:train_end].copy(),
+                    df.iloc[train_end:val_end].copy(),
+                    df.iloc[val_end:test_end].copy(),
+                )
+            )
+            start += step
+    else:
+        train_end = train_len
+        while True:
+            val_end = train_end + val_len
+            test_end = val_end + test_len
+            if test_end > n:
+                break
+            splits.append(
+                (
+                    df.iloc[:train_end].copy(),
+                    df.iloc[train_end:val_end].copy(),
+                    df.iloc[val_end:test_end].copy(),
+                )
+            )
+            train_end += step
+
+    return splits
+
 def calc_atr(df: pd.DataFrame, period: int) -> pd.Series:
     high = df["high"].astype(float)
     low = df["low"].astype(float)
@@ -730,7 +840,10 @@ def train_dqn(ohlc_df, pair=pair, save_dir="./Models",
               epsilon_start=0.99, epsilon_end=0.001, epsilon_decay=100000,
               device='cuda' if torch.cuda.is_available() else 'cpu',
               num_workers=2, max_time_hours=8,
-              target_action='high', asset_type='fx'):
+              target_action='high', asset_type='fx',
+              validation_df: Optional[pd.DataFrame] = None,
+              final_eval_df: Optional[pd.DataFrame] = None,
+              val_check_interval: int = 20):
     
     # 保存ディレクトリを確実に作成（絶対パスで）
     import os
@@ -977,6 +1090,7 @@ def train_dqn(ohlc_df, pair=pair, save_dir="./Models",
     # 学習統計
     loss_history = deque(maxlen=1000)
     reward_history = deque(maxlen=1000)
+    best_val_profit = -np.inf
     
     # エントリー統計
     entry_stats = {'Hold': 0, action_label: 0}
@@ -1195,6 +1309,27 @@ def train_dqn(ohlc_df, pair=pair, save_dir="./Models",
                 f"{action_label}:{entry_stats[action_label]}({action_pct:.1f}%)")
             print(f"[REWARDS] 平均報酬 - Hold:{avg_reward_hold:.3f}, "
                 f"{action_label}:{avg_reward_action:.3f}")
+
+            # Validation途中監視（時系列分割の中間区間のみで評価）
+            if validation_df is not None and len(validation_df) > max(window_size + 5, 50):
+                if episode % max(1, int(val_check_interval)) == 0:
+                    val_acc, val_profit, val_dd = evaluate_dqn_model(
+                        q,
+                        scaler,
+                        validation_df,
+                        n_eval=min(1500, len(validation_df) - 5),
+                        device=device,
+                        window_size=window_size,
+                        target_action=target_action,
+                        asset_type=asset_type,
+                        pair=pair,
+                    )
+                    if val_profit > best_val_profit:
+                        best_val_profit = val_profit
+                        torch.save(q.state_dict(), os.path.join(save_dir, f"best_val_{model_filename}"))
+                        print(f"[VAL] Updated best model by profit: {best_val_profit:.6f}")
+                    print(f"[VAL] Acc={val_acc:.3f}, Profit={val_profit:.6f}, MaxDD={val_dd:.6f}")
+                    q.train()
             
             # メモリ使用量をチェック（デバッグ用）
             if device.startswith('cuda'):
@@ -1225,18 +1360,29 @@ def train_dqn(ohlc_df, pair=pair, save_dir="./Models",
     
     # キャッシュクリア
     clear_feature_cache()
-    
+
+    eval_target_df = final_eval_df if final_eval_df is not None else ohlc_df
+    if eval_target_df is None or len(eval_target_df) < max(window_size + 5, 50):
+        print("[WARN] Skipping final evaluation due to insufficient evaluation rows")
+        return None
+
     print("[DONE] DQN training completed and saved.")
-    evaluate_dqn_model(
+    test_acc, test_profit, test_dd = evaluate_dqn_model(
         q,
         scaler,
-        ohlc_df,
+        eval_target_df,
         device=device,
         window_size=window_size,
         target_action=target_action,
         asset_type=asset_type,
         pair=pair,
     )
+    return {
+        "test_acc": float(test_acc),
+        "test_profit": float(test_profit),
+        "test_max_dd": float(test_dd),
+        "best_val_profit": float(best_val_profit) if np.isfinite(best_val_profit) else None,
+    }
 def evaluate_dqn_model(q, scaler, ohlc_df, n_eval=2000, device='cpu', window_size=20,
                       target_action='high', asset_type='fx', pair=pair):
     """
@@ -1424,6 +1570,21 @@ if __name__ == "__main__":
         default=os.getenv("TRAIN_PAIRS", ""),
         help="Optional comma-separated pair filter, e.g. BTCUSD,ETHUSD",
     )
+    parser.add_argument(
+        "--split-mode",
+        default=os.getenv("SPLIT_MODE", "single"),
+        choices=["single", "rolling", "expanding"],
+        help="single=70/15/15 split, rolling/expanding=walk-forward validation",
+    )
+    parser.add_argument("--train-ratio", type=float, default=float(os.getenv("TRAIN_RATIO", "0.70")))
+    parser.add_argument("--val-ratio", type=float, default=float(os.getenv("VAL_RATIO", "0.15")))
+    parser.add_argument("--test-ratio", type=float, default=float(os.getenv("TEST_RATIO", "0.15")))
+    parser.add_argument(
+        "--val-check-interval",
+        type=int,
+        default=int(os.getenv("VAL_CHECK_INTERVAL", "20")),
+        help="Validation monitor interval in episodes",
+    )
     args = parser.parse_args()
 
     print("[INFO] 高速化設定を適用中...")
@@ -1458,6 +1619,7 @@ if __name__ == "__main__":
         sys.exit(1)
 
     successful_jobs: List[str] = []
+    test_results: List[str] = []
 
     for pair_name, timeframe, csv_path in datasets:
         job_id = f"{pair_name}_{timeframe}"
@@ -1481,17 +1643,73 @@ if __name__ == "__main__":
 
             print(f"[INFO] Training target={job_id}, asset_type={pair_asset_type}, save_dir={pair_save_dir}")
 
-            for mode in ACTION_MODES.keys():
-                print("\n" + "=" * 80)
-                print(f"[INFO] Training {job_id} {mode.upper()} model")
-                print("=" * 80)
-                train_dqn(
+            split_mode = str(args.split_mode).lower()
+            if split_mode == "single":
+                train_df, val_df, test_df = _split_time_series(
                     df,
-                    pair=pair_name,
-                    target_action=mode,
-                    asset_type=pair_asset_type,
-                    save_dir=pair_save_dir,
+                    train_ratio=float(args.train_ratio),
+                    val_ratio=float(args.val_ratio),
                 )
+                print(
+                    f"[SPLIT] {job_id} -> train={len(train_df)} val={len(val_df)} test={len(test_df)}"
+                )
+
+                for mode in ACTION_MODES.keys():
+                    print("\n" + "=" * 80)
+                    print(f"[INFO] Training {job_id} {mode.upper()} model")
+                    print("=" * 80)
+                    metrics = train_dqn(
+                        train_df,
+                        pair=pair_name,
+                        target_action=mode,
+                        asset_type=pair_asset_type,
+                        save_dir=pair_save_dir,
+                        validation_df=val_df,
+                        final_eval_df=test_df,
+                        val_check_interval=max(1, int(args.val_check_interval)),
+                    )
+                    if metrics is not None:
+                        test_results.append(
+                            f"{job_id}/{mode}: acc={metrics['test_acc']:.3f}, profit={metrics['test_profit']:.6f}, max_dd={metrics['test_max_dd']:.6f}, best_val_profit={metrics['best_val_profit']}"
+                        )
+            else:
+                splits = _generate_walk_forward_splits(
+                    df,
+                    mode=split_mode,
+                    train_ratio=float(args.train_ratio),
+                    val_ratio=float(args.val_ratio),
+                    test_ratio=float(args.test_ratio),
+                )
+                if not splits:
+                    print(f"[WARN] {job_id}: no walk-forward split created. Skipping.")
+                    continue
+
+                print(f"[WF] {job_id}: mode={split_mode}, folds={len(splits)}")
+                for fold_idx, (train_df, val_df, test_df) in enumerate(splits, start=1):
+                    fold_id = f"{job_id}_{split_mode}_fold{fold_idx:02d}"
+                    fold_dir = os.path.join(pair_save_dir, f"{split_mode}_fold{fold_idx:02d}")
+                    print(
+                        f"[WF-SPLIT] {fold_id} -> train={len(train_df)} val={len(val_df)} test={len(test_df)}"
+                    )
+
+                    for mode in ACTION_MODES.keys():
+                        print("\n" + "=" * 80)
+                        print(f"[INFO] Training {fold_id} {mode.upper()} model")
+                        print("=" * 80)
+                        metrics = train_dqn(
+                            train_df,
+                            pair=pair_name,
+                            target_action=mode,
+                            asset_type=pair_asset_type,
+                            save_dir=fold_dir,
+                            validation_df=val_df,
+                            final_eval_df=test_df,
+                            val_check_interval=max(1, int(args.val_check_interval)),
+                        )
+                        if metrics is not None:
+                            test_results.append(
+                                f"{fold_id}/{mode}: acc={metrics['test_acc']:.3f}, profit={metrics['test_profit']:.6f}, max_dd={metrics['test_max_dd']:.6f}, best_val_profit={metrics['best_val_profit']}"
+                            )
 
             successful_jobs.append(job_id)
 
@@ -1505,4 +1723,8 @@ if __name__ == "__main__":
     print("\n" + "=" * 80)
     print(f"[INFO] 個別学習完了: {len(successful_jobs)} dataset(s)")
     print(f"[INFO] Success list: {', '.join(successful_jobs)}")
+    if test_results:
+        print("[INFO] Test summary:")
+        for row in test_results:
+            print(f"  - {row}")
     print("=" * 80)

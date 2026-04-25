@@ -9,12 +9,16 @@ ROWS ?=
 TH_LONG ?= 0.55
 TH_SHORT ?= 0.55
 
-.PHONY: help venv train backtest live-fx live-fx-check live-crypto live-crypto-check smoke clean
+.PHONY: help venv train train-single-m1 train-rolling-all-tf train-expanding-btceth train-single-val10 backtest live-fx live-fx-check live-crypto live-crypto-check smoke clean
 
 help:
 	@Write-Host "Available targets:" -ForegroundColor Cyan
 	@Write-Host "  make venv                      # .venv を作成してpip更新"
 	@Write-Host "  make train                     # train_dqn.py を実行" 
+	@Write-Host "  make train-single-m1           # 単純時系列3分割（70/15/15）で全M1"
+	@Write-Host "  make train-rolling-all-tf      # M1,M5,M15をrollingでウォークフォワード"
+	@Write-Host "  make train-expanding-btceth    # M1をBTCUSD,ETHUSD限定でexpanding"
+	@Write-Host "  make train-single-val10        # single分割でValidation監視頻度を10に変更"
 	@Write-Host "  make backtest                  # regime_backtest.py を実行" 
 	@Write-Host "  make backtest PAIR=EURUSD      # 通貨ペアを変更" 
 	@Write-Host "  make backtest DATA=data/EURUSD_M1.csv ROWS=20000 TH_LONG=0.56 TH_SHORT=0.55"
@@ -32,6 +36,18 @@ venv:
 
 train:
 	$(PY) train_dqn.py
+
+train-single-m1:
+	$(PY) train_dqn.py --timeframes M1 --split-mode single
+
+train-rolling-m1:
+	$(PY) train_dqn.py --timeframes M1 --split-mode rolling
+
+train-expanding-btceth:
+	$(PY) train_dqn.py --timeframes M1 --split-mode expanding
+
+train-single-val10:
+	$(PY) train_dqn.py --split-mode single --val-check-interval 10
 
 backtest:
 	$(PY) regime_backtest.py --pair $(PAIR) --data $(DATA) --th-long $(TH_LONG) --th-short $(TH_SHORT) $(if $(ROWS),--rows $(ROWS),)
